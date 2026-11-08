@@ -99,7 +99,7 @@ fn import_layers(record: &ImageRecord) -> Result<()> {
         let dir = paths::layer(digest);
         if !dir.exists() {
             eprintln!("importing {digest}");
-            layer::import(&paths::blob(digest), &dir, layer::chain(&imported))?;
+            layer::import(&paths::blob(digest), &dir, &imported)?;
         }
         imported.push(dir);
     }

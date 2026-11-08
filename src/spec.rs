@@ -16,17 +16,9 @@ pub const SCHEMA_V2_1: SchemaVersion = SchemaVersion { major: 2, minor: 1 };
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "PascalCase")]
 pub struct Layer {
-    /// Layer GUID, see [`crate::layer::layer_id`].
+    /// Layer GUID, see [`crate::layer::chain`].
     pub id: String,
     pub path: String,
-}
-
-/// `LayerData` document used by the computestorage APIs.
-#[derive(Serialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct LayerData {
-    pub schema_version: SchemaVersion,
-    pub layers: Vec<Layer>,
 }
 
 #[derive(Serialize)]
@@ -54,8 +46,7 @@ pub struct Container {
 pub struct Storage {
     /// Parent layers, topmost first.
     pub layers: Vec<Layer>,
-    /// Volume path of the mounted scratch layer (from HcsGetLayerVhdMountPath
-    /// or the storage filter attach).
+    /// Volume path of the mounted scratch layer (from GetLayerMountPath).
     pub path: String,
 }
 

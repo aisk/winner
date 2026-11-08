@@ -37,22 +37,29 @@ pub fn run(image_ref: &str, command: &[String], isolation: Isolation, tty: Optio
     result
 }
 
+/// Unmounts the scratch layer on every exit path of `run_inner`.
+struct Mounted<'a>(&'a std::path::Path);
+
+impl Drop for Mounted<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = layer::unmount(self.0) {
+            eprintln!("warning: unmount scratch layer: {e:#}");
+        }
+    }
+}
+
 fn run_inner(state: &mut ContainerState, image: &ImageRecord, tty: bool) -> Result<u32> {
-    let parents = layer::chain(&state.layers);
     let scratch = state.scratch();
-    layer::create_scratch(&scratch, parents.clone())?;
-    layer::attach(&scratch, parents.clone())?;
+    layer::create_scratch(&scratch, &state.layers)?;
+    let volume = layer::mount(&scratch, &state.layers)?;
+    let _mounted = Mounted(&scratch);
 
     let config = ComputeSystem {
         owner: "winner".into(),
         schema_version: spec::SCHEMA_V2_1,
         should_terminate_on_last_handle_closed: true,
         container: Some(Container {
-            storage: Storage {
-                layers: parents,
-                // TODO: confirm whether HCS wants the scratch dir or its volume path here.
-                path: scratch.to_string_lossy().into_owned(),
-            },
+            storage: Storage { layers: layer::chain(&state.layers)?, path: volume },
             mapped_directories: Vec::new(),
         }),
     };
@@ -85,6 +92,7 @@ fn run_inner(state: &mut ContainerState, image: &ImageRecord, tty: bool) -> Resu
     state.exit_code = Some(code);
     state.save()?;
     let _ = system.terminate();
+    drop(system);
     Ok(code)
 }
 
@@ -127,7 +135,7 @@ fn cleanup(state: &ContainerState) -> Result<()> {
     }
     let scratch = state.scratch();
     if scratch.exists() {
-        let _ = layer::detach(&scratch);
+        let _ = layer::unmount(&scratch); // may already be unmounted
         layer::destroy(&scratch)?;
     }
     std::fs::remove_dir_all(state.dir())?;
