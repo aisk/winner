@@ -25,7 +25,7 @@ impl ImageRecord {
     pub fn load(reference: &str) -> Result<Self> {
         let reference = normalize(reference);
         let data = std::fs::read(paths::image(&reference))
-            .with_context(|| format!("image {reference} not found locally, run `winner pull` first"))?;
+            .with_context(|| format!("image {reference} not found locally, run `winner image pull` first"))?;
         Ok(serde_json::from_slice(&data)?)
     }
 
@@ -50,6 +50,15 @@ pub fn normalize(reference: &str) -> String {
         .parse::<oci_client::Reference>()
         .map(|r| r.whole())
         .unwrap_or_else(|_| reference.to_string())
+}
+
+pub fn delete(reference: &str) -> Result<()> {
+    let reference = normalize(reference);
+    std::fs::remove_file(paths::image(&reference))
+        .with_context(|| format!("image {reference} not found locally"))?;
+    // TODO: garbage-collect layers and blobs no longer referenced by any image or container.
+    println!("{reference}");
+    Ok(())
 }
 
 pub fn list() -> Result<()> {

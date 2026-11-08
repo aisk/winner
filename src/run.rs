@@ -8,7 +8,8 @@ use crate::{Isolation, layer, paths, stdio};
 use anyhow::{Result, bail};
 use std::io::IsTerminal;
 
-pub fn run(image_ref: &str, command: &[String], isolation: Isolation, rm: bool) -> Result<u32> {
+/// `tty`: `None` auto-detects from whether stdin and stdout are terminals.
+pub fn run(image_ref: &str, command: &[String], isolation: Isolation, tty: Option<bool>, rm: bool) -> Result<u32> {
     if matches!(isolation, Isolation::Hyperv) {
         // TODO: utility VM (HostingSystemId + VirtualMachine schema).
         bail!("hyper-v isolation is not implemented yet");
@@ -26,7 +27,8 @@ pub fn run(image_ref: &str, command: &[String], isolation: Isolation, rm: bool) 
     };
     state.save()?;
 
-    let result = run_inner(&mut state, &image);
+    let tty = tty.unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
+    let result = run_inner(&mut state, &image, tty);
     if rm {
         if let Err(e) = cleanup(&state) {
             eprintln!("warning: cleanup failed: {e:#}");
@@ -35,7 +37,7 @@ pub fn run(image_ref: &str, command: &[String], isolation: Isolation, rm: bool) 
     result
 }
 
-fn run_inner(state: &mut ContainerState, image: &ImageRecord) -> Result<u32> {
+fn run_inner(state: &mut ContainerState, image: &ImageRecord, tty: bool) -> Result<u32> {
     let parents = layer::chain(&state.layers);
     let scratch = state.scratch();
     layer::create_scratch(&scratch, parents.clone())?;
@@ -59,7 +61,6 @@ fn run_inner(state: &mut ContainerState, image: &ImageRecord) -> Result<u32> {
     state.status = Status::Running;
     state.save()?;
 
-    let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let params = ProcessParameters {
         command_line: join_command_line(&state.command),
         working_directory: image.working_dir(),
