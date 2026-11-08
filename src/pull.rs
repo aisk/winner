@@ -10,6 +10,8 @@ use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 
 pub fn pull(reference: &str) -> Result<()> {
+    // Layer import needs these; fail before downloading hundreds of MB.
+    crate::backup::enable_privileges(&["SeBackupPrivilege", "SeRestorePrivilege"])?;
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let record = rt.block_on(fetch(reference))?;
     import_layers(&record)?;

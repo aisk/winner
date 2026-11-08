@@ -1,11 +1,13 @@
 //! Layer management on top of computestorage.dll.
 
+mod import;
+
 use crate::spec::{self, LayerData};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use windows::Win32::System::HostComputeSystem::*;
-use windows::core::HSTRING;
+use windows::core::{HSTRING, PCWSTR};
 
 /// Deterministic GUID for a layer path. HCS only needs the ID to be stable
 /// and unique per layer; it does not have to match Docker's NameToGuid.
@@ -37,26 +39,49 @@ fn layer_data(parents: Vec<spec::Layer>) -> Result<HSTRING> {
     Ok(HSTRING::from(serde_json::to_string(&doc)?))
 }
 
+// Legacy (HCS v1) vmcompute exports that have no computestorage equivalent
+// for wcifs-based layers. hcsshim uses the same calls.
+mod vmcompute {
+    windows_link::link!("vmcompute.dll" "system" fn ProcessBaseImage(path: windows::core::PCWSTR) -> windows::core::HRESULT);
+    windows_link::link!("vmcompute.dll" "system" fn ProcessUtilityImage(path: windows::core::PCWSTR) -> windows::core::HRESULT);
+}
+
 /// Import a compressed layer tarball into `layer_dir`.
 ///
 /// `parents` are the already-imported layers below this one, topmost first.
+/// On failure the partially written layer is removed.
 pub fn import(blob: &Path, layer_dir: &Path, parents: Vec<spec::Layer>) -> Result<()> {
-    let _ = (blob, layer_dir, parents);
-    // TODO: this is the hard part. Steps:
-    //   1. Enable SeBackupPrivilege + SeRestorePrivilege on the process token.
-    //   2. Stream the gzip tar into a temp staging dir with backup semantics:
-    //      - entries live under `Files/` and `Hives/`
-    //      - PAX headers carry MSWINDOWS.rawsd (security descriptor),
-    //        MSWINDOWS.fileattr, and possibly LIBARCHIVE.creationtime
-    //      - write files via CreateFileW(FILE_FLAG_BACKUP_SEMANTICS) + BackupWrite,
-    //        or set attributes/SD after a plain write
-    //      - whiteout entries (`.wh.<name>`) mark deletions
-    //   3. HcsImportLayer(layer_dir, staging_dir, layer_data(parents))
-    //   4. For the base layer (no parents): HcsSetupBaseOSLayer to process the
-    //      registry hives (needs a VHD handle for Hyper-V; process isolation may
-    //      not need it, to be verified).
-    // Reference: hcsshim pkg/ociwclayer + internal/wclayer.
-    bail!("layer import not implemented yet")
+    crate::backup::enable_privileges(&["SeBackupPrivilege", "SeRestorePrivilege"])?;
+    if !parents.is_empty() {
+        // TODO: port hcsshim's legacyLayerWriter (staging dir + tombstones.txt)
+        // and finish with HcsImportLayer.
+        bail!("importing non-base layers is not implemented yet");
+    }
+
+    std::fs::create_dir_all(layer_dir)?;
+    let result = import_base(blob, layer_dir);
+    // WINNER_KEEP_FAILED leaves the partial layer on disk for debugging.
+    if result.is_err() && std::env::var_os("WINNER_KEEP_FAILED").is_none() {
+        let _ = destroy(layer_dir);
+    }
+    result
+}
+
+fn import_base(blob: &Path, layer_dir: &Path) -> Result<()> {
+    let extracted = import::extract_base_layer(blob, layer_dir)?;
+    // Processes the registry hives under Hives/ and lays down the
+    // structure HCS expects for a base image.
+    let path = HSTRING::from(layer_dir.as_os_str());
+    unsafe { vmcompute::ProcessBaseImage(PCWSTR(path.as_ptr())) }
+        .ok()
+        .context("ProcessBaseImage")?;
+    if extracted.has_utility_vm {
+        let uvm = HSTRING::from(layer_dir.join("UtilityVM").as_os_str());
+        unsafe { vmcompute::ProcessUtilityImage(PCWSTR(uvm.as_ptr())) }
+            .ok()
+            .context("ProcessUtilityImage")?;
+    }
+    Ok(())
 }
 
 /// Create the writable scratch layer for a container.

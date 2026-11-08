@@ -1,5 +1,6 @@
 //! winner: a small, daemonless CLI for Windows containers built directly on HCS.
 
+mod backup;
 mod hcs;
 mod host;
 mod image;
