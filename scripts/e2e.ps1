@@ -1,0 +1,307 @@
+# End-to-end tests for winner. Needs an elevated shell, so run the whole
+# suite under a single elevation:
+#
+#   sudo pwsh -NoProfile -File scripts/e2e.ps1 [-Full] [-Only <pattern>]
+#
+# -Full also runs the image deletion tests, which delete the .NET test image
+# (about 225 MB to download again next time).
+# Results are printed and written to target\e2e.log.
+
+param(
+    [switch]$Full,
+    [string]$Only = '*',
+    [string]$Winner = (Join-Path $PSScriptRoot '..\target\debug\winner.exe')
+)
+
+$ErrorActionPreference = 'Stop'
+$Winner = (Resolve-Path $Winner).Path
+$Nano = 'mcr.microsoft.com/windows/nanoserver:ltsc2025'
+$Dotnet = 'mcr.microsoft.com/dotnet/runtime:10.0-nanoserver-ltsc2025'
+$Log = Join-Path $PSScriptRoot '..\target\e2e.log'
+
+$principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Error 'run this script elevated: sudo pwsh -NoProfile -File scripts/e2e.ps1'
+}
+
+$script:Passed = 0
+$script:Failed = [System.Collections.Generic.List[string]]::new()
+$script:Lines = [System.Collections.Generic.List[string]]::new()
+
+function Say([string]$Text, [string]$Color = 'Gray') {
+    Write-Host $Text -ForegroundColor $Color
+    $script:Lines.Add($Text)
+}
+
+# Run winner with a timeout. Stdin is redirected (and closed after $Stdin is
+# written), so tty auto-detection always picks "no tty".
+function W {
+    param([string[]]$A, [string]$Stdin = '', [int]$Timeout = 120)
+    $psi = [System.Diagnostics.ProcessStartInfo]::new($Winner)
+    foreach ($x in $A) { $psi.ArgumentList.Add($x) }
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    # winner writes UTF-8 to pipes; .NET would otherwise decode with the
+    # console code page (e.g. 936), mangling localized Windows error text.
+    $psi.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+    $psi.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $out = $p.StandardOutput.ReadToEndAsync()
+    $err = $p.StandardError.ReadToEndAsync()
+    if ($Stdin) { $p.StandardInput.Write($Stdin) }
+    $p.StandardInput.Close()
+    if (-not $p.WaitForExit($Timeout * 1000)) {
+        $p.Kill($true)
+        $p.WaitForExit()
+        $code = 'timeout'
+    } else {
+        $p.WaitForExit()
+        $code = $p.ExitCode
+    }
+    $r = [pscustomobject]@{ Code = $code; Out = $out.Result.TrimEnd(); Err = $err.Result.TrimEnd() }
+    $script:Lines.Add("    > winner $($A -join ' ')  [exit $code]")
+    foreach ($l in (($r.Out + "`n" + $r.Err).Trim() -split "`r?`n" | Select-Object -First 15)) { $script:Lines.Add("      $l") }
+    $r
+}
+
+function Check([string]$What, [bool]$Ok, $Result = $null) {
+    if ($Ok) {
+        $script:Passed++
+        Say "  ok   $What" 'Green'
+    } else {
+        $script:Failed.Add("$($script:Case): $What")
+        Say "  FAIL $What" 'Red'
+        if ($Result) {
+            Say "       exit: $($Result.Code)" 'DarkGray'
+            if ($Result.Out) { Say "       out:  $($Result.Out -replace "`r?`n", "`n             ")" 'DarkGray' }
+            if ($Result.Err) { Say "       err:  $($Result.Err -replace "`r?`n", "`n             ")" 'DarkGray' }
+        }
+    }
+}
+
+function Case([string]$Name, [scriptblock]$Body) {
+    if ($Name -notlike $Only) { return }
+    $script:Case = $Name
+    Say "== $Name" 'Cyan'
+    try { & $Body } catch { Check "no exception ($_)" $false }
+}
+
+function State([string]$Container) {
+    $r = W @('inspect', $Container)
+    if ($r.Code -ne 0) { return $null }
+    ($r.Out | ConvertFrom-Json)[0]
+}
+
+function WaitUntil([scriptblock]$Cond, [int]$Seconds = 30) {
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        if (& $Cond) { return $true }
+        Start-Sleep -Milliseconds 500
+    }
+    $false
+}
+
+function Cleanup {
+    try {
+        $r = W @('list', '--format', 'json')
+        if ($r.Code -eq 0 -and $r.Out) {
+            foreach ($c in ($r.Out | ConvertFrom-Json)) {
+                if ($c.name -like 'e2e-*') { W @('delete', '--force', $c.id) | Out-Null }
+            }
+        }
+    } catch {
+        Say "cleanup failed: $_" 'Yellow'
+    }
+}
+
+Say "winner e2e  $(Get-Date -Format s)  $Winner"
+Cleanup
+
+# --- basics ----------------------------------------------------------------
+
+Case 'pull' {
+    $r = W @('image', 'pull', $Nano) -Timeout 900
+    Check 'image pull nanoserver' ($r.Code -eq 0) $r
+    $r = W @('image', 'pull', 'nanoserver:ltsc2025')
+    Check 'pull with a short name is refused' ($r.Code -ne 0 -and $r.Err -match 'registry') $r
+}
+
+Case 'run' {
+    $r = W @('run', '--remove', $Nano, 'cmd', '/c', 'ver')
+    Check 'prints the container OS version' ($r.Code -eq 0 -and $r.Out -match 'Microsoft Windows') $r
+    $r = W @('run', '--remove', $Nano, 'cmd', '/c', 'exit 7')
+    Check 'passes the exit code through' ($r.Code -eq 7) $r
+    $r = W @('run', '--remove', $Nano) -Stdin "echo stdin-ok`r`n" -Timeout 60
+    Check 'default command reads stdin and exits at EOF' ($r.Code -eq 0 -and $r.Out -match 'stdin-ok') $r
+    $r = W @('run', '--remove', '--entrypoint', 'cmd.exe', $Nano, '/c', 'echo ep-ok')
+    Check '--entrypoint replaces the command' ($r.Code -eq 0 -and $r.Out -match 'ep-ok') $r
+    $r = W @('run', '--remove', '--pull', 'never', 'nanoserver:ltsc2025', 'cmd', '/c', 'echo short-ok')
+    Check 'short name finds the local image' ($r.Code -eq 0 -and $r.Out -match 'short-ok') $r
+    $r = W @('run', '--remove', 'example.invalid/nothing:1')
+    Check 'winner failures exit 125' ($r.Code -eq 125) $r
+}
+
+Case 'pull-always' {
+    $r = W @('run', '--remove', '--pull', 'always', 'nanoserver:ltsc2025', 'cmd', '/c', 'echo always-ok') -Timeout 900
+    Check '--pull always with a short local name' ($r.Code -eq 0 -and $r.Out -match 'always-ok') $r
+}
+
+Case 'options' {
+    $r = W @('run', '--remove', '-e', 'FOO=bar', '-w', 'C:\Windows', $Nano, 'cmd', '/c', 'echo [%FOO%] & cd')
+    Check '--env and --workdir' ($r.Code -eq 0 -and $r.Out -match '\[bar\]' -and $r.Out -match '(?m)^C:\\Windows\s*$') $r
+    $r = W @('run', '--remove', $Nano, 'cmd', '/c', 'echo user=%USERNAME%')
+    Check 'image default user (ContainerUser)' ($r.Out -match 'user=ContainerUser') $r
+    $r = W @('run', '--remove', '-u', 'ContainerAdministrator', $Nano, 'cmd', '/c', 'echo user=%USERNAME%')
+    Check '--user overrides it' ($r.Out -match 'user=ContainerAdministrator') $r
+}
+
+Case 'volumes' {
+    $dir = Join-Path ([IO.Path]::GetTempPath()) "winner-e2e-$PID"
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    Set-Content (Join-Path $dir 'hello.txt') 'from-host'
+    try {
+        # Host ACLs still apply: the temp directory is only open to its owner
+        # and administrators, so these run as ContainerAdministrator.
+        $r = W @('run', '--remove', '-u', 'ContainerAdministrator', '-v', "${dir}:C:\data:ro", $Nano, 'cmd', '/c', 'type C:\data\hello.txt')
+        Check 'read a mapped directory' ($r.Code -eq 0 -and $r.Out -match 'from-host') $r
+        $r = W @('run', '--remove', '-u', 'ContainerAdministrator', '-v', "${dir}:C:\data:ro", $Nano, 'cmd', '/c', 'echo x> C:\data\ro.txt')
+        Check 'read-only mapping refuses writes' ($r.Code -ne 0 -and -not (Test-Path (Join-Path $dir 'ro.txt'))) $r
+        $r = W @('run', '--remove', '-v', "${dir}:C:\data:ro", $Nano, 'cmd', '/c', 'type C:\data\hello.txt')
+        Check 'ContainerUser is subject to host ACLs' ($r.Code -ne 0 -and ($r.Out + $r.Err) -match 'denied') $r
+        $r = W @('run', '--remove', '-u', 'ContainerAdministrator', '-v', "${dir}:C:\data", $Nano, 'cmd', '/c', 'echo from-container> C:\data\rw.txt')
+        $written = Test-Path (Join-Path $dir 'rw.txt')
+        Check 'read-write mapping reaches the host' ($r.Code -eq 0 -and $written) $r
+        $r = W @('run', '--remove', '-v', 'C:\definitely\missing:C:\data', $Nano)
+        Check 'missing host directory is rejected' ($r.Code -eq 125) $r
+    } finally {
+        Remove-Item -Recurse -Force $dir
+    }
+}
+
+Case 'names' {
+    $r = W @('run', '--name', 'e2e-named', $Nano, 'cmd', '/c', 'exit 3')
+    Check 'named run' ($r.Code -eq 3) $r
+    $r = W @('run', '--name', 'e2e-named', $Nano, 'cmd', '/c', 'ver')
+    Check 'duplicate name is refused' ($r.Code -eq 125 -and $r.Err -match 'already in use') $r
+    $s = State 'e2e-named'
+    Check 'inspect by name shows exit code 3' ($s -and $s.status -eq 'exited' -and $s.exit_code -eq 3)
+    $r = W @('list', '--format', 'json')
+    Check 'list --format json includes it' ($r.Code -eq 0 -and (($r.Out | ConvertFrom-Json).name -contains 'e2e-named')) $r
+    $r = W @('delete', $s.id.Substring(0, 8))
+    Check 'delete by ID prefix' ($r.Code -eq 0) $r
+    $r = W @('delete', 'e2e-named', 'e2e-nothing')
+    Check 'delete of a missing container fails' ($r.Code -ne 0) $r
+}
+
+# --- detached lifecycle ----------------------------------------------------
+
+Case 'detach' {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $r = W @('run', '-d', '--name', 'e2e-bg', $Nano, 'ping', '-n', '120', '127.0.0.1')
+    Check 'run -d returns promptly with the ID' ($r.Code -eq 0 -and $r.Out -match '^[0-9a-f]{32}$' -and $sw.Elapsed.TotalSeconds -lt 60) $r
+    Check 'it is running' ((State 'e2e-bg').status -eq 'running')
+    Check 'logs show its output' (WaitUntil { (W @('logs', 'e2e-bg')).Out -match 'Reply from 127.0.0.1' })
+    $r = W @('exec', 'e2e-bg', 'cmd', '/c', 'echo exec-ok')
+    Check 'exec runs in it' ($r.Code -eq 0 -and $r.Out -match 'exec-ok') $r
+    $r = W @('exec', 'e2e-bg', 'cmd', '/c', 'exit 5')
+    Check 'exec passes the exit code through' ($r.Code -eq 5) $r
+    $r = W @('delete', 'e2e-bg')
+    Check 'delete refuses a running container' ($r.Code -ne 0 -and $r.Err -match 'running') $r
+    $r = W @('stop', '--timeout', '5', 'e2e-bg') -Timeout 60
+    Check 'stop' ($r.Code -eq 0) $r
+    Check 'it is exited' ((State 'e2e-bg').status -eq 'exited')
+    $r = W @('logs', '--follow', 'e2e-bg') -Timeout 15
+    Check 'logs --follow returns for a stopped container' ($r.Code -eq 0) $r
+    $r = W @('start', 'e2e-bg')
+    Check 'start it again' ($r.Code -eq 0 -and (State 'e2e-bg').status -eq 'running') $r
+    $r = W @('kill', 'e2e-bg')
+    Check 'kill' ($r.Code -eq 0 -and (State 'e2e-bg').status -eq 'exited') $r
+    $r = W @('delete', 'e2e-bg')
+    Check 'delete' ($r.Code -eq 0) $r
+}
+
+Case 'create-start' {
+    $r = W @('create', '--name', 'e2e-created', $Nano, 'cmd', '/c', 'echo created-ok')
+    Check 'create' ($r.Code -eq 0) $r
+    Check 'status is created' ((State 'e2e-created').status -eq 'created')
+    $r = W @('start', 'e2e-created')
+    Check 'start' ($r.Code -eq 0) $r
+    $r = W @('logs', '--follow', 'e2e-created') -Timeout 60
+    Check 'logs --follow prints the output and ends' ($r.Code -eq 0 -and $r.Out -match 'created-ok') $r
+    $s = State 'e2e-created'
+    Check 'exited with code 0' ($s.status -eq 'exited' -and $s.exit_code -eq 0)
+    W @('delete', 'e2e-created') | Out-Null
+}
+
+Case 'detach-remove' {
+    $r = W @('run', '-d', '--remove', '--name', 'e2e-gone', $Nano, 'cmd', '/c', 'echo bye')
+    Check 'run -d --remove' ($r.Code -eq 0) $r
+    Check 'container deletes itself after exiting' (WaitUntil { -not (State 'e2e-gone') })
+}
+
+Case 'start-failure' {
+    # HCS accepts a missing working directory, so use a missing executable.
+    $r = W @('create', '--name', 'e2e-bad', '--entrypoint', 'C:\does\not\exist.exe', $Nano)
+    $r = W @('start', 'e2e-bad')
+    Check 'start reports a failure to launch the process' ($r.Code -ne 0) $r
+    $s = State 'e2e-bad'
+    Check 'the error is kept in the state' ($s -and $s.error)
+    $r = W @('run', '--remove', '--entrypoint', 'C:\does\not\exist.exe', $Nano)
+    Check 'foreground run of a missing executable exits 125' ($r.Code -eq 125) $r
+    W @('delete', '--force', 'e2e-bad') | Out-Null
+}
+
+Case 'orphan' {
+    W @('run', '-d', '--name', 'e2e-orphan', $Nano, 'ping', '-n', '120', '127.0.0.1') | Out-Null
+    $id = (State 'e2e-orphan').id
+    $shim = Get-CimInstance Win32_Process -Filter "Name = 'winner.exe'" | Where-Object { $_.CommandLine -match "shim $id" }
+    Check 'shim process found' ([bool]$shim)
+    if ($shim) { Stop-Process -Id $shim.ProcessId -Force }
+    Check 'killed supervisor is noticed as exited' (WaitUntil { (State 'e2e-orphan').status -eq 'exited' })
+    $r = W @('delete', 'e2e-orphan')
+    Check 'delete without --force' ($r.Code -eq 0) $r
+}
+
+# --- non-base layers -------------------------------------------------------
+
+Case 'layers' {
+    $r = W @('image', 'pull', $Dotnet) -Timeout 1800
+    Check 'pull a multi-layer image' ($r.Code -eq 0) $r
+    $r = W @('run', '--remove', $Dotnet, 'cmd', '/c', 'dotnet --list-runtimes')
+    Check 'files from upper layers and PATH from their registry hives' ($r.Code -eq 0 -and $r.Out -match 'Microsoft\.NETCore\.App 10\.') $r
+    $r = W @('run', '--remove', $Dotnet, 'cmd', '/c', 'echo user=%USERNAME% v=%DOTNET_VERSION%')
+    Check 'image user and env' ($r.Out -match 'user=ContainerUser' -and $r.Out -match 'v=10\.') $r
+}
+
+if ($Full) {
+    Case 'image-delete' {
+        W @('create', '--name', 'e2e-keep', $Dotnet, 'cmd', '/c', 'dotnet --list-runtimes') | Out-Null
+        $r = W @('image', 'delete', $Dotnet)
+        Check 'image in use is refused' ($r.Code -ne 0) $r
+        $r = W @('image', 'delete', '--force', $Dotnet)
+        Check 'image delete --force' ($r.Code -eq 0) $r
+        $r = W @('start', 'e2e-keep')
+        $logs = W @('logs', '--follow', 'e2e-keep') -Timeout 60
+        Check 'its container still runs from the kept layers' ($r.Code -eq 0 -and $logs.Out -match 'Microsoft\.NETCore\.App') $logs
+        $layers = (Get-ChildItem "$env:ProgramData\winner\layers").Count
+        W @('delete', 'e2e-keep') | Out-Null
+        $after = (Get-ChildItem "$env:ProgramData\winner\layers").Count
+        Check 'deleting the last user collects its layers' ($after -lt $layers)
+        $r = W @('image', 'list', '--format', 'json')
+        Check 'nanoserver is untouched' ((($r.Out | ConvertFrom-Json).reference) -contains $Nano) $r
+    }
+}
+
+Cleanup
+Say ''
+if ($script:Failed.Count -eq 0) {
+    Say "all $($script:Passed) checks passed" 'Green'
+} else {
+    Say "$($script:Passed) passed, $($script:Failed.Count) failed:" 'Red'
+    foreach ($f in $script:Failed) { Say "  $f" 'Red' }
+}
+$script:Lines | Set-Content -Encoding utf8 $Log
+Write-Host "log: $((Resolve-Path $Log).Path)"
+exit $script:Failed.Count
