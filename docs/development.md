@@ -81,7 +81,8 @@ Non-base layers need hcsshim's `legacyLayerWriter` (staging directory,
   works without DISM:
   - `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\Notifications\OptionalFeatures\Containers`,
     value `Selection` (1 = enabled)
-  - the `CmService` service exists once the feature is active
+  - `CmService` is not a reliable signal: on Windows 11 26100 the feature is
+    enabled and containers run without that service present
   - `...\Component Based Servicing\RebootPending` exists while a reboot is pending
 - **Defender Controlled Folder Access** blocks direct disk writes from
   unknown executables (event 1127 in
@@ -94,6 +95,16 @@ Non-base layers need hcsshim's `legacyLayerWriter` (staging directory,
   26100.x (enablement package); check `ntdll.dll`'s file version. hcsshim's
   rule (`osversion.CheckHostAndContainerCompat`): from LTSC2022 on, a host
   runs images from the latest LTSC below it up to its own build.
+
+- **Stdin EOF**: closing our end of the stdin pipe from
+  `HcsCreateProcess` does not reach the container, because vmcompute relays
+  the stream. Send `HcsModifyProcess` with
+  `{"Operation":"CloseHandle","CloseHandle":{"Handle":"StdIn"}}` after the
+  copy finishes (hcsshim's `CloseStdin`), or `echo x | winner run ... cmd`
+  hangs forever.
+- **`cmd /c` quoting**: cmd does not parse its command line with the MSVCRT
+  rules, so an argument ending in a backslash (`"... dir C:\"`) arrives with
+  the backslash doubled. Pass such commands as separate arguments.
 
 ## Debugging
 

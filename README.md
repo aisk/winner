@@ -5,8 +5,8 @@ directly on the Host Compute Service (HCS) APIs. No Docker, no containerd,
 no background service of its own: a single executable that talks to
 `vmcompute` the same way hcsshim does.
 
-> **Status: early work in progress.** Pulling and importing a base image
-> works; starting a container is not verified end to end yet.
+> **Status: early work in progress.** Pulling a base image and running a
+> process-isolated container in the foreground works.
 
 ## Requirements
 
@@ -59,7 +59,7 @@ The release binary is a single ~7 MB executable with no runtime dependencies.
 - [x] Registry pull with Windows platform selection
 - [x] Base layer import
 - [x] Scratch layer create / mount (process isolation)
-- [ ] Run a process-isolated container end to end
+- [x] Run a process-isolated container in the foreground
 - [ ] Non-base layer import
 - [ ] Networking (HCN)
 - [ ] Hyper-V isolation
