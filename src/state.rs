@@ -1,6 +1,7 @@
 //! Container state persisted on disk. There is no daemon, so this file is
 //! the only record of a container besides what vmcompute tracks.
 
+use crate::network::PortMapping;
 use crate::spec::MappedDirectory;
 use crate::{Format, Isolation, paths, table};
 use anyhow::{Context, Result, bail};
@@ -39,6 +40,11 @@ pub struct ContainerState {
     pub process: ProcessConfig,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<MappedDirectory>,
+    /// HNS network to connect to; `None` runs without networking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<PortMapping>,
     /// Delete the container once it exits.
     #[serde(default)]
     pub remove: bool,
@@ -87,11 +93,44 @@ impl ContainerState {
         Ok(())
     }
 
+    /// Held by the supervisor for as long as it runs, so others can tell a
+    /// live run from one whose supervisor was killed (see [`supervised`]).
+    /// Deleting the container directory is still allowed.
+    pub fn lock_supervisor(&self) -> Result<std::fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_DELETE: u32 = 4;
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(FILE_SHARE_DELETE)
+            .open(self.dir().join(LOCK))
+            .map_err(|e| match e.raw_os_error() {
+                Some(ERROR_SHARING_VIOLATION) => anyhow::anyhow!("container {} is already running", self.id),
+                _ => anyhow::Error::new(e).context("lock container"),
+            })
+    }
+
     pub fn load(id: &str) -> Result<Self> {
         let data = std::fs::read(paths::container(id).join("state.json"))
             .with_context(|| format!("container {id} not found"))?;
         Ok(serde_json::from_slice(&data)?)
     }
+}
+
+const LOCK: &str = "supervisor.lock";
+
+/// Whether a supervisor process currently runs container `id`. Unlike the
+/// recorded status this cannot go stale: the lock dies with the process.
+pub fn supervised(id: &str) -> bool {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    let lock = paths::container(id).join(LOCK);
+    matches!(
+        std::fs::File::open(lock).map_err(|e| e.raw_os_error()),
+        Err(Some(ERROR_SHARING_VIOLATION))
+    )
 }
 
 /// Length of the ID prefix shown in tables.
@@ -175,8 +214,6 @@ pub fn list(format: Format) -> Result<()> {
     match format {
         Format::Json => println!("{}", serde_json::to_string_pretty(&containers)?),
         Format::Table => {
-            // TODO: reconcile with HcsEnumerateComputeSystems, a "running" record
-            // may be stale if the CLI was killed.
             let rows: Vec<_> = containers
                 .iter()
                 .map(|s| {
@@ -189,11 +226,12 @@ pub fn list(format: Format) -> Result<()> {
                         s.name.clone().unwrap_or_default(),
                         s.image.clone(),
                         status,
+                        s.ports.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
                         s.command.join(" "),
                     ]
                 })
                 .collect();
-            table::print(["ID", "NAME", "IMAGE", "STATUS", "COMMAND"], &rows);
+            table::print(["ID", "NAME", "IMAGE", "STATUS", "PORTS", "COMMAND"], &rows);
         }
     }
     Ok(())

@@ -15,6 +15,8 @@ use std::io::Write;
 
 pub fn main(id: &str) -> Result<()> {
     let mut state = ContainerState::load(id)?;
+    // Fails if another supervisor runs this container; leave its state alone.
+    let lock = state.lock_supervisor()?;
     let result = run::execute(&mut state, Io::Log);
     if let Err(e) = &result {
         let message = format!("{e:#}");
@@ -26,6 +28,7 @@ pub fn main(id: &str) -> Result<()> {
         state.error = Some(message);
         state.save()?;
     }
+    drop(lock);
     if state.remove && result.is_ok() {
         run::cleanup(&state)?;
     }

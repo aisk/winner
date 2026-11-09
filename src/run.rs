@@ -7,9 +7,9 @@
 
 use crate::hcs::System;
 use crate::image::ImageRecord;
-use crate::spec::{self, ComputeSystem, Container, MappedDirectory, ProcessParameters, Storage};
+use crate::spec::{self, ComputeSystem, Container, MappedDirectory, Networking, ProcessParameters, Storage};
 use crate::state::{self, ContainerState, ProcessConfig, Status};
-use crate::{Isolation, Pull, host, image, layer, paths, pull, stdio};
+use crate::{Isolation, Pull, host, image, layer, network, paths, pull, stdio};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -26,6 +26,9 @@ pub struct Options {
     pub workdir: Option<String>,
     pub user: Option<String>,
     pub volumes: Vec<String>,
+    /// Network name, `none`, or `None` for the default network.
+    pub network: Option<String>,
+    pub publish: Vec<String>,
     pub remove: bool,
 }
 
@@ -51,6 +54,8 @@ pub fn create(image_ref: &str, args: &[String], opts: Options) -> Result<Contain
         state::validate_name(name)?;
     }
     let mounts = opts.volumes.iter().map(|v| parse_volume(v)).collect::<Result<_>>()?;
+    let ports: Vec<_> = opts.publish.iter().map(|p| network::parse_publish(p)).collect::<Result<_>>()?;
+    let network = network::resolve(opts.network.as_deref(), &ports)?;
 
     let state = ContainerState {
         id: state::new_id()?,
@@ -70,6 +75,8 @@ pub fn create(image_ref: &str, args: &[String], opts: Options) -> Result<Contain
             user: opts.user.or_else(|| image.user()),
         },
         mounts,
+        network,
+        ports,
         remove: opts.remove,
     };
     state.save()?;
@@ -90,7 +97,9 @@ pub fn run(image_ref: &str, args: &[String], opts: Options, detach: bool, tty: O
         return Ok(0);
     }
     let tty = tty.unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
+    let lock = state.lock_supervisor()?;
     let result = execute(&mut state, Io::Console { tty });
+    drop(lock);
     if state.remove {
         if let Err(e) = cleanup(&state) {
             eprintln!("warning: cleanup failed: {e:#}");
@@ -190,11 +199,26 @@ impl Drop for Mounted<'_> {
     }
 }
 
-/// Supervise one run of the container until its process exits.
+/// Terminates the compute system on every exit path of `execute`, before
+/// the network and scratch layer it uses are released.
+struct Terminating(System);
+
+impl Drop for Terminating {
+    fn drop(&mut self) {
+        let _ = self.0.terminate(); // fails harmlessly if already stopped
+    }
+}
+
+/// Supervise one run of the container until its process exits. The caller
+/// holds the supervisor lock ([`ContainerState::lock_supervisor`]).
 pub fn execute(state: &mut ContainerState, io: Io) -> Result<u32> {
     let scratch = state.scratch();
+    // Left mounted by a supervisor that was killed; we hold the lock, so no
+    // live run uses it.
+    let _ = layer::unmount(&scratch);
     let volume = layer::mount(&scratch, &state.layers)?;
     let _mounted = Mounted(&scratch);
+    let network = network::attach(state)?;
 
     let config = ComputeSystem {
         owner: "winner".into(),
@@ -204,9 +228,11 @@ pub fn execute(state: &mut ContainerState, io: Io) -> Result<u32> {
         container: Some(Container {
             storage: Storage { layers: layer::chain(&state.layers)?, path: volume },
             mapped_directories: state.mounts.clone(),
+            networking: network.as_ref().map(|n| Networking { namespace: n.namespace.clone() }),
         }),
     };
-    let system = System::create(&state.id, &config)?;
+    let system = Terminating(System::create(&state.id, &config)?);
+    let system = &system.0;
     system.start()?;
 
     let (tty, stdin) = match io {
@@ -235,7 +261,6 @@ pub fn execute(state: &mut ContainerState, io: Io) -> Result<u32> {
     state.status = Status::Exited;
     state.exit_code = Some(code);
     state.save()?;
-    let _ = system.terminate();
     Ok(code)
 }
 
@@ -416,6 +441,12 @@ pub fn quote_arg(a: &str) -> String {
 pub fn cleanup(state: &ContainerState) -> Result<()> {
     if let Ok(system) = System::open(&state.id) {
         let _ = system.terminate();
+    }
+    if state.network.as_deref().is_some_and(|n| n != network::HOST) {
+        // A failure leaves objects that `network::sweep` finds later.
+        if let Err(e) = network::release(&state.id) {
+            eprintln!("warning: release network: {e:#}");
+        }
     }
     let scratch = state.scratch();
     if scratch.exists() {

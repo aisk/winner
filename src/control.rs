@@ -90,7 +90,19 @@ pub fn remove(query: &str, force: bool) -> Result<()> {
 
 pub fn inspect(queries: &[String]) -> Result<()> {
     let states = queries.iter().map(|q| state::resolve(q)).collect::<Result<Vec<_>>>()?;
-    println!("{}", serde_json::to_string_pretty(&states)?);
+    let mut out = Vec::new();
+    for s in states {
+        let mut v = serde_json::to_value(&s)?;
+        if s.network.is_some() && s.is_running() {
+            match crate::network::endpoint_summary(&s.id) {
+                Ok(Some(e)) => v["endpoint"] = e,
+                Ok(None) => {}
+                Err(e) => eprintln!("warning: query endpoint of {}: {e:#}", s.id),
+            }
+        }
+        out.push(v);
+    }
+    println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
 }
 

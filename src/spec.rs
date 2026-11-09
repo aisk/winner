@@ -38,7 +38,15 @@ pub struct Container {
     pub storage: Storage,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mapped_directories: Vec<MappedDirectory>,
-    // TODO: Networking { Namespace } once HCN is wired up.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub networking: Option<Networking>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct Networking {
+    /// HCN namespace (GUID) holding the container's endpoints.
+    pub namespace: String,
 }
 
 #[derive(Serialize)]

@@ -2,10 +2,12 @@
 
 mod backup;
 mod control;
+mod hcn;
 mod hcs;
 mod host;
 mod image;
 mod layer;
+mod network;
 mod paths;
 mod pull;
 mod run;
@@ -120,6 +122,11 @@ enum Command {
         #[command(subcommand)]
         command: ImageCommand,
     },
+    /// Manage networks
+    Network {
+        #[command(subcommand)]
+        command: NetworkCommand,
+    },
     /// Internal: per-container supervisor for detached containers
     #[command(hide = true)]
     Shim { id: String },
@@ -151,6 +158,12 @@ struct ContainerArgs {
     /// Map a host directory into the container
     #[arg(short, long = "volume", value_name = "HOST:CONTAINER[:ro]")]
     volumes: Vec<String>,
+    /// Network to connect to, "host" to share the host's network, or "none" (default: the "winner" NAT network, created on demand)
+    #[arg(long)]
+    network: Option<String>,
+    /// Publish a container port on the host
+    #[arg(short, long = "publish", value_name = "HOST:CONTAINER[/udp]")]
+    publish: Vec<String>,
     /// Override the image entrypoint (drops the image's default arguments)
     #[arg(long)]
     entrypoint: Option<String>,
@@ -181,6 +194,8 @@ impl ContainerArgs {
             workdir: self.workdir,
             user: self.user,
             volumes: self.volumes,
+            network: self.network,
+            publish: self.publish,
             remove: self.remove,
         };
         (self.image, self.command, opts)
@@ -213,6 +228,37 @@ enum ImageCommand {
         force: bool,
         #[arg(required = true)]
         images: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum NetworkCommand {
+    /// Create a NAT network
+    Create {
+        /// IPv4 subnet, e.g. 172.30.0.0/16 (default: picked by the system)
+        #[arg(long)]
+        subnet: Option<String>,
+        /// Gateway address (default: the first address of the subnet)
+        #[arg(long, requires = "subnet")]
+        gateway: Option<String>,
+        name: String,
+    },
+    /// List networks, including those created by other tools
+    #[command(visible_alias = "ls")]
+    List {
+        #[arg(long, value_enum, default_value_t = Format::Table)]
+        format: Format,
+    },
+    /// Show network details as JSON
+    Inspect {
+        #[arg(required = true)]
+        networks: Vec<String>,
+    },
+    /// Delete networks created by winner
+    #[command(visible_alias = "rm")]
+    Delete {
+        #[arg(required = true)]
+        networks: Vec<String>,
     },
 }
 
@@ -290,6 +336,14 @@ fn dispatch(command: Command) -> Result<i32> {
                 image::collect_garbage();
                 deleted
             }
+        }),
+        Command::Network { command } => done(match command {
+            NetworkCommand::Create { subnet, gateway, name } => {
+                network::create(&name, subnet.as_deref(), gateway.as_deref()).map(|_| println!("{name}"))
+            }
+            NetworkCommand::List { format } => network::list(format),
+            NetworkCommand::Inspect { networks } => network::inspect(&networks),
+            NetworkCommand::Delete { networks } => each(&networks, |n| network::delete(n).map(|()| println!("{n}"))),
         }),
         Command::Shim { id } => done(shim::main(&id)),
     }

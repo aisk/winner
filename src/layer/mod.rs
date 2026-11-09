@@ -56,8 +56,13 @@ fn wide(path: &Path) -> HSTRING {
 /// Layer GUID as HCS derives it: NameToGuid of the layer directory name.
 fn layer_guid(path: &Path) -> Result<GUID> {
     let name = path.file_name().context("layer path has no file name")?;
+    name_to_guid(&HSTRING::from(name))
+}
+
+/// vmcompute's stable name-to-GUID hash, also used for network object IDs.
+pub fn name_to_guid(name: &HSTRING) -> Result<GUID> {
     let mut id = GUID::zeroed();
-    unsafe { vmcompute::NameToGuid(PCWSTR(HSTRING::from(name).as_ptr()), &mut id) }
+    unsafe { vmcompute::NameToGuid(PCWSTR(name.as_ptr()), &mut id) }
         .ok()
         .context("NameToGuid")?;
     Ok(id)
