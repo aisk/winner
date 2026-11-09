@@ -4,9 +4,10 @@
 //! writable-layer functions target VHD/CimFS layers and do not apply here.
 
 mod import;
+mod legacy;
 
 use crate::spec;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use windows::Win32::Foundation::{ERROR_DEVICE_NOT_CONNECTED, ERROR_NOT_READY};
 use windows::Win32::System::HostComputeSystem::HcsDestroyLayer;
@@ -23,6 +24,7 @@ mod vmcompute {
     windows_link::link!("vmcompute.dll" "system" fn DeactivateLayer(info: *const DriverInfo, id: PCWSTR) -> HRESULT);
     windows_link::link!("vmcompute.dll" "system" fn PrepareLayer(info: *const DriverInfo, id: PCWSTR, layers: *const LayerDescriptor, count: u32) -> HRESULT);
     windows_link::link!("vmcompute.dll" "system" fn UnprepareLayer(info: *const DriverInfo, id: PCWSTR) -> HRESULT);
+    windows_link::link!("vmcompute.dll" "system" fn ImportLayer(info: *const DriverInfo, id: PCWSTR, path: PCWSTR, layers: *const LayerDescriptor, count: u32) -> HRESULT);
     windows_link::link!("vmcompute.dll" "system" fn GetLayerMountPath(info: *const DriverInfo, id: PCWSTR, length: *mut usize, buffer: *mut u16) -> HRESULT);
 }
 
@@ -98,14 +100,8 @@ fn descriptors(base_first: &[PathBuf]) -> Result<Descriptors> {
 /// On failure the partially written layer is removed.
 pub fn import(blob: &Path, layer_dir: &Path, parents: &[PathBuf]) -> Result<()> {
     crate::backup::enable_privileges(&["SeBackupPrivilege", "SeRestorePrivilege"])?;
-    if !parents.is_empty() {
-        // TODO: port hcsshim's legacyLayerWriter (staging dir + tombstones.txt)
-        // and finish with vmcompute ImportLayer.
-        bail!("importing non-base layers is not implemented yet");
-    }
-
     std::fs::create_dir_all(layer_dir)?;
-    let result = import_base(blob, layer_dir);
+    let result = if parents.is_empty() { import_base(blob, layer_dir) } else { import_layer(blob, layer_dir, parents) };
     // WINNER_KEEP_FAILED leaves the partial layer on disk for debugging.
     if result.is_err() && std::env::var_os("WINNER_KEEP_FAILED").is_none() {
         let _ = destroy(layer_dir);
@@ -114,18 +110,45 @@ pub fn import(blob: &Path, layer_dir: &Path, parents: &[PathBuf]) -> Result<()> 
 }
 
 fn import_base(blob: &Path, layer_dir: &Path) -> Result<()> {
-    let extracted = import::extract_base_layer(blob, layer_dir)?;
+    let mut sink = import::BaseSink::new(layer_dir)?;
+    import::write_layer(blob, &mut sink)?;
+    sink.finish()?;
     // Processes the registry hives under Hives/ and lays down blank.vhdx etc.
     unsafe { vmcompute::ProcessBaseImage(PCWSTR(wide(layer_dir).as_ptr())) }
         .ok()
         .context("ProcessBaseImage")?;
-    if extracted.has_utility_vm {
+    if sink.has_utility_vm {
         let uvm = wide(&layer_dir.join("UtilityVM"));
         unsafe { vmcompute::ProcessUtilityImage(PCWSTR(uvm.as_ptr())) }
             .ok()
             .context("ProcessUtilityImage")?;
     }
     Ok(())
+}
+
+/// Non-base layer: stage, `ImportLayer`, then fix up (hcsshim legacyLayerWriterWrapper).
+fn import_layer(blob: &Path, layer_dir: &Path, parents: &[PathBuf]) -> Result<()> {
+    let staging = crate::paths::root().join("tmp").join(format!("import-{:032x}", GUID::new()?.to_u128()));
+    std::fs::create_dir_all(&staging)?;
+    let result = (|| {
+        let mut sink = legacy::LegacySink::new(&staging, parents)?;
+        import::write_layer(blob, &mut sink)?;
+        sink.finish()?;
+
+        let info = driver_info();
+        let desc = descriptors(parents)?;
+        let (id, path) = (wide(layer_dir), wide(&staging));
+        unsafe {
+            vmcompute::ImportLayer(&info, PCWSTR(id.as_ptr()), PCWSTR(path.as_ptr()), desc.list.as_ptr(), desc.list.len() as u32)
+        }
+        .ok()
+        .context("ImportLayer")?;
+        legacy::apply(&sink, &std::fs::canonicalize(layer_dir)?)
+    })();
+    if let Err(e) = std::fs::remove_dir_all(&staging) {
+        eprintln!("warning: remove {}: {e}", staging.display());
+    }
+    result
 }
 
 /// Create the container's scratch layer (sandbox.vhdx, cloned from the base layer's blank.vhdx).

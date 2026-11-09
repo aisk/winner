@@ -112,15 +112,18 @@ pub fn encode_reparse_point(target: &str, mount_point: bool) -> Vec<u8> {
     b
 }
 
-/// A file being restored through `BackupWrite` with security processing on.
+/// A file being restored through `BackupWrite`.
 pub struct BackupFile {
     file: File,
     ctx: *mut c_void,
+    process_security: bool,
 }
 
 impl BackupFile {
-    pub fn new(file: File) -> Self {
-        Self { file, ctx: std::ptr::null_mut() }
+    /// `process_security` restores security descriptors from the stream
+    /// (go-winio's NewBackupFileWriter `includeSecurity`).
+    pub fn new(file: File, process_security: bool) -> Self {
+        Self { file, ctx: std::ptr::null_mut(), process_security }
     }
 
     fn handle(&self) -> HANDLE {
@@ -131,7 +134,7 @@ impl BackupFile {
 impl Write for BackupFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut n = 0u32;
-        unsafe { BackupWrite(self.handle(), buf, &mut n, false, true, &mut self.ctx) }
+        unsafe { BackupWrite(self.handle(), buf, &mut n, false, self.process_security, &mut self.ctx) }
             .map_err(io::Error::from)?;
         Ok(n as usize)
     }

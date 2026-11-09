@@ -1,9 +1,11 @@
-//! Extract a Windows OCI layer tarball into a base layer directory.
+//! Read a Windows OCI layer tarball and hand each entry to a layer writer.
 //!
-//! Port of hcsshim `pkg/ociwclayer/import.go` + `internal/wclayer/baselayerwriter.go`
-//! and go-winio `backuptar`. Each tar entry becomes a file created with backup
-//! semantics, whose contents, security descriptor, EAs, reparse data and
-//! alternate data streams are restored through a single `BackupWrite` stream.
+//! Port of hcsshim `pkg/ociwclayer/import.go` and go-winio `backuptar`. Every
+//! entry is converted into a Win32 backup stream (security descriptor, EAs,
+//! reparse data, file data, alternate data streams); what happens to that
+//! stream is up to the `Sink`:
+//!   - `BaseSink`: restore it in place with `BackupWrite` (hcsshim baseLayerWriter)
+//!   - `legacy::LegacySink`: stage it in the vmcompute import format
 
 use crate::backup::{self, BackupFile};
 use anyhow::{Context, Result, anyhow, bail};
@@ -14,8 +16,8 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use windows::Win32::Storage::FileSystem::{
-    CreateDirectoryW, CreateHardLinkW, FILE_ATTRIBUTE_DIRECTORY, FILE_BASIC_INFO,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    CreateDirectoryW, CreateHardLinkW, FILE_ATTRIBUTE_DIRECTORY, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT,
 };
 use windows::core::HSTRING;
 
@@ -27,22 +29,40 @@ const PAX_EA_PREFIX: &str = "MSWINDOWS.xattr.";
 const PAX_CREATION_TIME: &str = "LIBARCHIVE.creationtime";
 const WHITEOUT_PREFIX: &str = ".wh.";
 
-// Access rights used by hcsshim's baseLayerWriter.
-const GENERIC_READ: u32 = 0x8000_0000;
-const GENERIC_WRITE: u32 = 0x4000_0000;
+// Access rights used by hcsshim's layer writers.
+pub(super) const GENERIC_READ: u32 = 0x8000_0000;
+pub(super) const GENERIC_WRITE: u32 = 0x4000_0000;
 const WRITE_DAC: u32 = 0x0004_0000;
 const WRITE_OWNER: u32 = 0x0008_0000;
 const ACCESS_SYSTEM_SECURITY: u32 = 0x0100_0000;
-const FILE_SHARE_READ: u32 = 1;
+pub(super) const FILE_SHARE_READ: u32 = 1;
 
-/// Summary of an extracted base layer.
-pub struct Extracted {
-    pub has_utility_vm: bool,
+/// One file or directory of a layer, as handed to a `Sink`.
+pub(super) struct Entry<'a> {
+    /// Validated relative path with `/` separators, e.g. `Files/Windows/notepad.exe`.
+    pub name: &'a str,
+    pub info: FILE_BASIC_INFO,
+    /// Directory or file is a symlink / junction.
+    pub reparse: bool,
 }
 
-/// Extract `blob` (gzip or plain tar) into `root`, which must exist and be empty.
-/// The caller must hold SeBackupPrivilege and SeRestorePrivilege.
-pub fn extract_base_layer(blob: &Path, root: &Path) -> Result<Extracted> {
+impl Entry<'_> {
+    pub fn is_dir(&self) -> bool {
+        self.info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0
+    }
+}
+
+pub(super) trait Sink {
+    /// Start a file or directory; the returned writer receives its backup stream.
+    fn add(&mut self, entry: &Entry) -> Result<Box<dyn Write>>;
+    /// Hard link `name` to `target`, both validated relative paths.
+    fn add_link(&mut self, name: &str, target: &str) -> Result<()>;
+    /// A whiteout: `name` existed in a parent layer and is deleted here.
+    fn remove(&mut self, name: &str) -> Result<()>;
+}
+
+/// Feed every entry of `blob` (gzip or plain tar) to `sink`.
+pub(super) fn write_layer(blob: &Path, sink: &mut impl Sink) -> Result<()> {
     let mut input = BufReader::with_capacity(1 << 20, File::open(blob)?);
     let gzip = input.fill_buf()?.starts_with(&[0x1f, 0x8b]);
     let reader: Box<dyn Read> = if gzip {
@@ -51,50 +71,40 @@ pub fn extract_base_layer(blob: &Path, root: &Path) -> Result<Extracted> {
         Box::new(input)
     };
 
-    let mut writer = BaseLayerWriter::new(root)?;
+    let mut driver = Driver { current: None, reparse_points: HashSet::new() };
     let mut archive = tar::Archive::new(reader);
     for entry in archive.entries()? {
         let mut entry = entry?;
-        let name = String::from_utf8(entry.path_bytes().into_owned())
-            .map_err(|_| anyhow!("non UTF-8 path in layer"))?;
+        let name = String::from_utf8(entry.path_bytes().into_owned()).map_err(|_| anyhow!("non UTF-8 path in layer"))?;
         let name = name.trim_start_matches("./").trim_end_matches('/').to_string();
         if name.is_empty() {
             continue;
         }
-        writer.entry(&name, &mut entry).with_context(|| format!("extract {name}"))?;
+        driver.entry(sink, &name, &mut entry).with_context(|| format!("extract {name}"))?;
     }
-    writer.finish()
+    driver.close_current()
 }
 
 struct Current {
     name: String,
-    out: BackupFile,
+    out: Box<dyn Write>,
 }
 
-struct BaseLayerWriter {
-    root: PathBuf,
+struct Driver {
     current: Option<Current>,
-    /// Directories and their metadata, parents before children.
-    dirs: Vec<(PathBuf, FILE_BASIC_INFO)>,
     /// Lower-cased names of reparse points, which must never be traversed.
     reparse_points: HashSet<String>,
-    has_utility_vm: bool,
 }
 
-impl BaseLayerWriter {
-    fn new(root: &Path) -> Result<Self> {
-        // Verbatim (\\?\) root so long paths work and nothing is normalized.
-        let root = std::fs::canonicalize(root)?;
-        Ok(Self {
-            root,
-            current: None,
-            dirs: Vec::new(),
-            reparse_points: HashSet::new(),
-            has_utility_vm: false,
-        })
+impl Driver {
+    fn close_current(&mut self) -> Result<()> {
+        if let Some(mut cur) = self.current.take() {
+            cur.out.flush().with_context(|| format!("write {}", cur.name))?;
+        }
+        Ok(())
     }
 
-    fn entry<R: Read>(&mut self, name: &str, entry: &mut tar::Entry<R>) -> Result<()> {
+    fn entry<R: Read>(&mut self, sink: &mut impl Sink, name: &str, entry: &mut tar::Entry<R>) -> Result<()> {
         let kind = entry.header().entry_type();
 
         // Alternate data stream of the file currently being written.
@@ -112,50 +122,29 @@ impl BaseLayerWriter {
                 }
             }
         }
-        self.current = None;
+        self.close_current()?;
 
-        let base = name.rsplit('/').next().unwrap_or(name);
-        if base.starts_with(WHITEOUT_PREFIX) {
-            bail!("base layer cannot contain whiteouts");
+        let (dir, base) = name.rsplit_once('/').unwrap_or(("", name));
+        if let Some(deleted) = base.strip_prefix(WHITEOUT_PREFIX) {
+            let target = if dir.is_empty() { deleted.to_string() } else { format!("{dir}/{deleted}") };
+            self.validate(&target)?;
+            return sink.remove(&target);
         }
 
+        self.validate(name)?;
         if kind.is_hard_link() {
-            let target = entry
-                .link_name_bytes()
-                .ok_or_else(|| anyhow!("hard link without target"))?;
+            let target = entry.link_name_bytes().ok_or_else(|| anyhow!("hard link without target"))?;
             let target = String::from_utf8(target.into_owned())?;
-            let link = self.resolve(name)?;
-            let target = self.resolve(target.trim_start_matches("./"))?;
-            unsafe { CreateHardLinkW(&HSTRING::from(link.as_os_str()), &HSTRING::from(target.as_os_str()), None) }
-                .context("CreateHardLinkW")?;
-            return Ok(());
-        }
-
-        if name.eq_ignore_ascii_case("UtilityVM/Files") {
-            self.has_utility_vm = true;
+            let target = target.trim_start_matches("./");
+            self.validate(target)?;
+            return sink.add_link(name, target);
         }
 
         let pax = pax_records(entry)?;
         let info = basic_info(entry.header(), &pax)?;
-        let path = self.resolve(name)?;
-        let is_dir = info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
+        let reparse = kind.is_symlink();
+        let mut out = sink.add(&Entry { name, info, reparse })?;
 
-        let mut opts = std::fs::OpenOptions::new();
-        opts.access_mode(GENERIC_READ | GENERIC_WRITE | WRITE_DAC | WRITE_OWNER | ACCESS_SYSTEM_SECURITY)
-            .share_mode(FILE_SHARE_READ)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0);
-        let file = if is_dir {
-            unsafe { CreateDirectoryW(&HSTRING::from(path.as_os_str()), None) }.context("CreateDirectoryW")?;
-            self.dirs.push((path.clone(), info));
-            opts.open(&path)
-        } else {
-            // std requires write(true) for create_new; access_mode still decides the rights.
-            opts.write(true).create_new(true).open(&path)
-        }
-        .context("open")?;
-        backup::set_basic_info(&file, &info).context("SetFileBasicInfo")?;
-
-        let mut out = BackupFile::new(file);
         if let Some(sd) = security_descriptor(&pax)? {
             out.write_all(&backup::stream_header(backup::BACKUP_SECURITY_DATA, sd.len() as u64, ""))?;
             out.write_all(&sd)?;
@@ -166,10 +155,8 @@ impl BaseLayerWriter {
             out.write_all(&backup::stream_header(backup::BACKUP_EA_DATA, data.len() as u64, ""))?;
             out.write_all(&data)?;
         }
-        if kind.is_symlink() {
-            let target = entry
-                .link_name_bytes()
-                .ok_or_else(|| anyhow!("symlink without target"))?;
+        if reparse {
+            let target = entry.link_name_bytes().ok_or_else(|| anyhow!("symlink without target"))?;
             let target = String::from_utf8(target.into_owned())?.replace('/', "\\");
             let data = backup::encode_reparse_point(&target, pax.iter().any(|(k, _)| k == PAX_MOUNT_POINT));
             out.write_all(&backup::stream_header(backup::BACKUP_REPARSE_DATA, data.len() as u64, ""))?;
@@ -187,11 +174,10 @@ impl BaseLayerWriter {
         Ok(())
     }
 
-    /// Map a tar path to a host path under the root, refusing anything that
-    /// could escape it: `..`, drive or stream syntax, or walking through a
-    /// reparse point created earlier in this layer.
-    fn resolve(&self, name: &str) -> Result<PathBuf> {
-        let mut path = self.root.clone();
+    /// Refuse any path that could escape the layer root: `..`, drive or
+    /// stream syntax, or walking through a reparse point created earlier in
+    /// this layer.
+    fn validate(&self, name: &str) -> Result<()> {
         let mut prefix = String::new();
         for comp in name.split('/') {
             if comp.is_empty() || comp == "." || comp == ".." || comp.contains(['\\', ':']) {
@@ -204,25 +190,89 @@ impl BaseLayerWriter {
                 prefix.push('/');
             }
             prefix.push_str(&comp.to_ascii_lowercase());
-            path.push(comp);
         }
-        Ok(path)
+        Ok(())
+    }
+}
+
+/// Join a validated relative name onto a root directory.
+pub(super) fn join(root: &Path, name: &str) -> PathBuf {
+    let mut path = root.to_path_buf();
+    path.extend(name.split('/'));
+    path
+}
+
+/// Whether `name` lies strictly inside the top-level directory `dir`
+/// (hcsshim's hasPathPrefix, case-insensitive like the file system).
+pub(super) fn under(name: &str, dir: &str) -> bool {
+    name.len() > dir.len() && name.as_bytes()[dir.len()] == b'/' && name[..dir.len()].eq_ignore_ascii_case(dir)
+}
+
+pub(super) fn open_dir_for_times(path: &Path) -> io::Result<File> {
+    std::fs::OpenOptions::new()
+        .access_mode(GENERIC_READ | GENERIC_WRITE)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(path)
+}
+
+/// Writes a base layer directly into its final directory.
+pub(super) struct BaseSink {
+    root: PathBuf,
+    /// Directories and their metadata, parents before children.
+    dirs: Vec<(PathBuf, FILE_BASIC_INFO)>,
+    pub has_utility_vm: bool,
+}
+
+impl BaseSink {
+    pub fn new(root: &Path) -> Result<Self> {
+        // Verbatim (\\?\) root so long paths work and nothing is normalized.
+        Ok(Self { root: std::fs::canonicalize(root)?, dirs: Vec::new(), has_utility_vm: false })
     }
 
-    fn finish(mut self) -> Result<Extracted> {
-        self.current = None;
-        // Creating children bumped the directories' times; restore them,
-        // children first.
+    /// Creating children bumped the directories' times; restore them, children first.
+    pub fn finish(&self) -> Result<()> {
         for (path, info) in self.dirs.iter().rev() {
-            let dir = std::fs::OpenOptions::new()
-                .access_mode(GENERIC_READ | GENERIC_WRITE)
-                .share_mode(FILE_SHARE_READ)
-                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
-                .open(path)
-                .with_context(|| format!("reopen {}", path.display()))?;
+            let dir = open_dir_for_times(path).with_context(|| format!("reopen {}", path.display()))?;
             backup::set_basic_info(&dir, info)?;
         }
-        Ok(Extracted { has_utility_vm: self.has_utility_vm })
+        Ok(())
+    }
+}
+
+impl Sink for BaseSink {
+    fn add(&mut self, entry: &Entry) -> Result<Box<dyn Write>> {
+        if entry.name.eq_ignore_ascii_case("UtilityVM/Files") {
+            self.has_utility_vm = true;
+        }
+        let path = join(&self.root, entry.name);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.access_mode(GENERIC_READ | GENERIC_WRITE | WRITE_DAC | WRITE_OWNER | ACCESS_SYSTEM_SECURITY)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0);
+        let file = if entry.is_dir() {
+            unsafe { CreateDirectoryW(&HSTRING::from(path.as_os_str()), None) }.context("CreateDirectoryW")?;
+            self.dirs.push((path.clone(), entry.info));
+            opts.open(&path)
+        } else {
+            // std requires write(true) for create_new; access_mode still decides the rights.
+            opts.write(true).create_new(true).open(&path)
+        }
+        .context("open")?;
+        backup::set_basic_info(&file, &entry.info).context("SetFileBasicInfo")?;
+        Ok(Box::new(BackupFile::new(file, true)))
+    }
+
+    fn add_link(&mut self, name: &str, target: &str) -> Result<()> {
+        let link = join(&self.root, name);
+        let target = join(&self.root, target);
+        unsafe { CreateHardLinkW(&HSTRING::from(link.as_os_str()), &HSTRING::from(target.as_os_str()), None) }
+            .context("CreateHardLinkW")?;
+        Ok(())
+    }
+
+    fn remove(&mut self, _name: &str) -> Result<()> {
+        bail!("base layer cannot contain whiteouts")
     }
 }
 
@@ -290,4 +340,18 @@ fn extended_attributes(pax: &[(String, Vec<u8>)]) -> Result<Vec<(String, Vec<u8>
         .filter_map(|(k, v)| Some((k.strip_prefix(PAX_EA_PREFIX)?, v)))
         .map(|(name, v)| Ok((name.to_string(), base64::engine::general_purpose::STANDARD.decode(v)?)))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::under;
+
+    #[test]
+    fn path_prefix() {
+        assert!(under("Files/a", "Files"));
+        assert!(under("files/a/b", "Files"));
+        assert!(!under("Files", "Files"));
+        assert!(!under("FilesX/a", "Files"));
+        assert!(!under("Hives", "Files"));
+    }
 }
