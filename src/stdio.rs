@@ -11,13 +11,15 @@ use windows::Win32::System::Console::*;
 
 /// Start forwarding. Returns the output threads, which finish once the
 /// container closes its ends of the pipes. The stdin thread is detached
-/// because a console read cannot be cancelled portably.
-pub fn forward(stdio: Stdio) -> Vec<JoinHandle<()>> {
+/// because a console read cannot be cancelled portably. `on_stdin_eof` runs
+/// once host stdin is exhausted, to propagate EOF into the container.
+pub fn forward(stdio: Stdio, on_stdin_eof: impl FnOnce() + Send + 'static) -> Vec<JoinHandle<()>> {
     if let Some(h) = stdio.stdin {
         std::thread::spawn(move || {
             let mut pipe = File::from(h);
             let _ = io::copy(&mut io::stdin().lock(), &mut pipe);
-            // Dropping the pipe sends EOF to the container.
+            drop(pipe);
+            on_stdin_eof();
         });
     }
     let mut out = Vec::new();

@@ -79,10 +79,17 @@ fn run_inner(state: &mut ContainerState, image: &ImageRecord, tty: bool) -> Resu
         create_std_err_pipe: !tty, // ConPTY merges stderr into stdout
     };
     let (process, pipes) = system.create_process(&params)?;
+    let process = std::sync::Arc::new(process);
 
     let _raw = tty.then(stdio::RawConsole::enable);
     // TODO: forward console resize events (HcsModifyProcess with ConsoleSize).
-    let outputs = stdio::forward(pipes);
+    let outputs = stdio::forward(pipes, {
+        let process = process.clone();
+        move || {
+            // Fails harmlessly if the process already exited.
+            let _ = process.close_stdin();
+        }
+    });
     let code = process.wait()?;
     for t in outputs {
         let _ = t.join();

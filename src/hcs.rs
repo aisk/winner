@@ -154,6 +154,16 @@ impl Process {
             .unwrap_or(0);
         Ok(code as u32)
     }
+
+    /// Signal EOF on the process's stdin. Closing our end of the pipe is not
+    /// enough because vmcompute relays the stream; hcsshim does the same.
+    pub fn close_stdin(&self) -> Result<()> {
+        let req = r#"{"Operation":"CloseHandle","CloseHandle":{"Handle":"StdIn"}}"#;
+        let op = Operation::new();
+        unsafe { HcsModifyProcess(self.0, op.0, &HSTRING::from(req)) }.context("HcsModifyProcess")?;
+        op.wait().context("close process stdin")?;
+        Ok(())
+    }
 }
 
 impl Drop for Process {
