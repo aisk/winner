@@ -11,6 +11,8 @@ layer/      layer import and scratch layer mount
   legacy.rs   non-base layers: hcsshim legacyLayerWriter + vmcompute ImportLayer
 backup.rs   Win32 backup stream encoding, privileges, FILETIME helpers
 hcs.rs      synchronous wrappers over computecore.dll (HCS v2)
+hcn.rs      synchronous wrappers over computenetwork.dll (HCN, the HNS v2 API)
+network.rs  networks, per-container endpoints and namespaces, port mappings
 run.rs      create, run, start; `execute` supervises one run of a container
 control.rs  stop, kill, exec, logs, inspect, delete (by container ID via vmcompute)
 shim.rs     detached supervisor: `execute` with output to the container log
@@ -34,8 +36,38 @@ On-disk layout under `%ProgramData%\winner`:
 blobs/<algo>/<hex>          downloaded layer blobs
 layers/<algo>-<hex>/        imported read-only layers
 images/<escaped-ref>.json   image records
-containers/<id>/            state.json + scratch/
+containers/<id>/            state.json, scratch/, log, supervisor.lock
 ```
+
+## System resources: ownership and cleanup
+
+Some resources live outside winner's directory and outlive the process that
+created them: the mounted scratch layer (vmcompute) and a container's HNS
+endpoint and namespace. Only the compute system itself is tied to its
+handle. Without a daemon, nobody is guaranteed to clean up after a killed
+supervisor, so these follow three rules instead of being recorded in
+state.json:
+
+1. **Derivable IDs.** Every object's ID follows from the container ID
+   (`NameToGuid("winner/endpoint/<id>")`, `.../namespace/<id>`, and the
+   scratch directory path), so it can always be found again. state.json only
+   records what the user asked for (network name, ports).
+2. **Idempotent create and release.** A supervisor releases leftovers of its
+   container before creating them again (unmount the scratch layer, delete
+   the endpoint and namespace). Releasing something that is not there
+   succeeds.
+3. **Sweeping.** Before connecting a container, `network::sweep` enumerates
+   HNS endpoints named `winner-<32 hex>` whose ID matches the derived one and
+   releases those whose container has no live supervisor.
+
+"Live supervisor" is decided by `supervisor.lock`: the supervisor (`run` in
+the foreground, or `winner shim`) holds it open without read sharing for as
+long as it runs, so opening it fails with a sharing violation exactly while
+the supervisor is alive. Unlike `status` in state.json this cannot go stale.
+It also stops two supervisors from running the same container.
+
+The namespace is deleted before the endpoint: a leftover endpoint is found
+again by name, a namespace has no name.
 
 ## Which APIs, and why
 
@@ -98,6 +130,50 @@ the topmost parent that has it), and directory times are re-applied because
 both steps bump them. UtilityVM content in non-base layers is not supported
 yet (only needed for Hyper-V isolation).
 
+## Networking
+
+HNS objects (all created through HCN):
+
+| Object | winner's use |
+|---|---|
+| Network | `winner` NAT network, created on first use; user networks via `network create` |
+| Endpoint | one per running container, carries IP, MAC, DNS and `PortMapping` policies |
+| Namespace | one per running container, holds its endpoint |
+
+A process-isolated container joins a namespace through
+`Container.Networking.Namespace` in the HCS document (as hcsshim does for
+schema v2): create the endpoint on the network, create the namespace, add the
+endpoint (`HcnModifyNamespace` with
+`{"ResourceType":"Endpoint","RequestType":"Add","Settings":{"EndpointId":"..."}}`),
+then create the compute system. Everything is released after the compute
+system is terminated (`Terminating` guard in `run::execute`).
+
+`--network host` uses the host's default namespace (`"Type": "HostDefault"`,
+`NamespaceId` 1 in an HCN query; `IsDefault: true` in `hnsdiag -d`) instead: the container sees the host's
+adapters and binds host ports directly. Nothing is created or released.
+
+Details that matter:
+
+- HCN returns strings allocated with `CoTaskMemAlloc` (HCS uses `LocalAlloc`).
+- The namespace request key is `EndpointId`. With `ID` it fails with
+  `HCN_E_ENDPOINT_NOT_FOUND` (0x803B0002), which looks like an ID problem.
+- `HcnCreateEndpoint` / `HcnCreateNetwork` / `HcnCreateNamespace` keep the
+  GUID the caller passes; that is what makes derived IDs work. Two winner
+  processes creating the default network at once collide on the same ID
+  instead of creating two networks.
+- HCN reports GUIDs in either case; compare parsed GUIDs, not strings.
+- A NAT network created without `Ipams` gets a free subnet picked by HNS
+  (e.g. `172.24.176.0/20`), and comes back with `Flags: 8`
+  (non-persistent): it is gone after a reboot, hence on-demand creation.
+- Query results omit `Type` for NAT networks; `hnsdiag list networks` shows
+  it.
+- HNS fills the endpoint's DNS servers from the host; nothing to configure.
+- Published ports are reachable through `localhost`, the host's own
+  addresses and the container IP (checked on 26100). Containers on the same
+  network reach each other by IP.
+- `hnsdiag list networks|endpoints|namespaces [-d]` (elevated) shows what
+  HNS holds; useful to spot leaks.
+
 ## Environment pitfalls
 
 - **Containers feature**: `Get-WindowsOptionalFeature` may fail ("class not
@@ -144,6 +220,9 @@ yet (only needed for Hyper-V isolation).
   status is never written back: the supervisor is the only writer of
   state.json, and a read-modify-write from `list` / `inspect` once wiped the
   error a failing shim had just recorded.
+- **Restart after a killed supervisor**: the scratch layer is still
+  activated, and `ActivateLayer` fails with a sharing violation (0x80070020).
+  `execute` unmounts first; the supervisor lock guarantees no live run uses it.
 - **When a container counts as running**: only after `HcsCreateProcess`
   succeeds. Marking it right after the compute system starts made `start`
   report success for a process that then failed to launch.

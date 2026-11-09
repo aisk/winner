@@ -6,7 +6,7 @@ no background service of its own: a single executable that talks to
 `vmcompute` the same way hcsshim does.
 
 > **Status: early work in progress.** Process-isolated containers run in
-> the foreground or background; there is no networking yet.
+> the foreground or background, with NAT networking and published ports.
 
 ## Requirements
 
@@ -43,6 +43,13 @@ winner stop demo
 winner start demo
 winner delete --force demo
 
+# networking
+winner run -d --name web -p 8080:8080 mcr.microsoft.com/dotnet/samples:aspnetapp-nanoserver-ltsc2025
+curl http://localhost:8080/
+winner network create --subnet 172.30.0.0/24 backend
+winner run --remove --network backend nanoserver:ltsc2025 ipconfig
+winner network list
+
 winner create --name later nanoserver:ltsc2025 cmd /c echo hi
 winner start later
 winner list
@@ -76,6 +83,16 @@ as aliases for `list` and `delete`. A tty is detected automatically;
 - Containers are addressed by ID, a unique ID prefix, or `--name`. `delete`
   takes several at once and refuses running containers unless `--force`.
 - `image delete` also removes layers no image or container uses anymore.
+- Containers join the `winner` NAT network, created on first use (and again
+  after a reboot, since NAT networks do not persist). `--network NAME` picks
+  another network, `--network none` runs without one, and `--network host`
+  shares the host's network stack (no isolation of ports or adapters).
+- `--publish HOST:CONTAINER[/udp]` (`-p`) maps a host port; it is reachable
+  on `localhost` and the host's addresses. `inspect` shows a running
+  container's IP address.
+- `network create|list|inspect|delete` manages NAT networks. `network list`
+  also shows networks of other tools (such as `Default Switch`); only
+  networks winner created can be deleted.
 - `list` and `image list` print tables; pass `--format json` for scripts.
 - `run` and `exec` exit with the process's exit code, or 125 if winner itself fails.
 
@@ -105,7 +122,7 @@ Results are also written to `target\e2e.log`.
 - [x] Run a process-isolated container in the foreground
 - [x] Non-base layer import
 - [x] Detached containers, logs, exec, stop / kill
-- [ ] Networking (HCN)
+- [x] Networking (HCN): NAT, published ports, host and none modes
 - [ ] Hyper-V isolation
 
 See [docs/development.md](docs/development.md) for design notes.
