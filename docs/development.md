@@ -106,6 +106,11 @@ Non-base layers need hcsshim's `legacyLayerWriter` (staging directory,
   rules, so an argument ending in a backslash (`"... dir C:\"`) arrives with
   the backslash doubled. Pass such commands as separate arguments.
 
+- **`ArgsEscaped`**: Windows image configs may set `ArgsEscaped: true`, in
+  which case Entrypoint/Cmd hold an already escaped command line. Those
+  image-provided parts are joined verbatim; only user-supplied arguments are
+  quoted.
+
 ## Debugging
 
 - Run the built exe elevated rather than `sudo cargo run`, so `target/`

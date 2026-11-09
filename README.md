@@ -34,15 +34,24 @@ no background service of its own: a single executable that talks to
 ```powershell
 winner image pull mcr.microsoft.com/windows/nanoserver:ltsc2025
 winner image list
-winner run --rm mcr.microsoft.com/windows/nanoserver:ltsc2025 cmd /c ver
+winner run --remove mcr.microsoft.com/windows/nanoserver:ltsc2025 cmd /c ver
+winner run --name demo mcr.microsoft.com/windows/nanoserver:ltsc2025
 winner list
-winner delete <id>
+winner delete demo
 ```
 
 Container operations live at the top level; other resources are grouped as
 `<noun> <verb>` (`image pull`, `image list`, ...). `ls` and `rm` are accepted
 as aliases for `list` and `delete`. A tty is detected automatically;
 `--tty` / `--no-tty` override it.
+
+- Without a command, `run` uses the image's entrypoint and command;
+  `--entrypoint` replaces the entrypoint.
+- Isolation is picked automatically: process isolation when the image build
+  is compatible with the host.
+- Containers are addressed by ID, a unique ID prefix, or `--name`.
+- `list` and `image list` print tables; pass `--format json` for scripts.
+- `run` exits with the container's exit code, or 125 if winner itself fails.
 
 Data is stored under `%ProgramData%\winner`.
 

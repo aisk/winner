@@ -1,6 +1,6 @@
 //! Local image records.
 
-use crate::paths;
+use crate::{Format, paths, table};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +38,29 @@ impl ImageRecord {
             .filter_map(|v| v.as_str()?.split_once('=').map(|(k, v)| (k.into(), v.into())))
     }
 
+    pub fn entrypoint(&self) -> Vec<String> {
+        self.string_array("Entrypoint")
+    }
+
+    pub fn cmd(&self) -> Vec<String> {
+        self.string_array("Cmd")
+    }
+
+    /// Set by Windows image builders when Entrypoint/Cmd hold an already
+    /// escaped command line that must be passed through verbatim.
+    pub fn args_escaped(&self) -> bool {
+        self.config["config"]["ArgsEscaped"].as_bool().unwrap_or(false)
+    }
+
+    fn string_array(&self, key: &str) -> Vec<String> {
+        self.config["config"][key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(Into::into))
+            .collect()
+    }
+
     pub fn working_dir(&self) -> Option<String> {
         self.config["config"]["WorkingDir"].as_str().filter(|s| !s.is_empty()).map(Into::into)
     }
@@ -61,16 +84,46 @@ pub fn delete(reference: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn list() -> Result<()> {
+/// Summary of an image for `image list --format json`.
+#[derive(Serialize)]
+struct Summary<'a> {
+    reference: &'a str,
+    digest: &'a str,
+    os_version: Option<&'a str>,
+    layers: &'a [String],
+}
+
+pub fn list(format: Format) -> Result<()> {
     let Ok(dir) = std::fs::read_dir(paths::images()) else {
         return Ok(());
     };
-    println!("{:<60} {:<20} DIGEST", "REFERENCE", "OS VERSION");
-    for entry in dir.flatten() {
-        let Ok(data) = std::fs::read(entry.path()) else { continue };
-        let Ok(rec) = serde_json::from_slice::<ImageRecord>(&data) else { continue };
-        let short = rec.manifest_digest.trim_start_matches("sha256:").get(..12).unwrap_or("");
-        println!("{:<60} {:<20} {short}", rec.reference, rec.os_version.as_deref().unwrap_or("-"));
+    let records: Vec<ImageRecord> = dir
+        .flatten()
+        .filter_map(|e| serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok())
+        .collect();
+    match format {
+        Format::Json => {
+            let summaries: Vec<_> = records
+                .iter()
+                .map(|r| Summary {
+                    reference: &r.reference,
+                    digest: &r.manifest_digest,
+                    os_version: r.os_version.as_deref(),
+                    layers: &r.layers,
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&summaries)?);
+        }
+        Format::Table => {
+            let rows: Vec<_> = records
+                .iter()
+                .map(|r| {
+                    let short = r.manifest_digest.trim_start_matches("sha256:").get(..12).unwrap_or("");
+                    [r.reference.clone(), r.os_version.clone().unwrap_or_else(|| "-".into()), short.into()]
+                })
+                .collect();
+            table::print(["REFERENCE", "OS VERSION", "DIGEST"], &rows);
+        }
     }
     Ok(())
 }

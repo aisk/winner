@@ -12,6 +12,7 @@ mod shim;
 mod spec;
 mod state;
 mod stdio;
+mod table;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -29,10 +30,16 @@ enum Command {
     Run {
         /// Remove the container after it exits
         #[arg(long)]
-        rm: bool,
-        /// Isolation mode
-        #[arg(long, value_enum, default_value_t = Isolation::Process)]
-        isolation: Isolation,
+        remove: bool,
+        /// Name the container, usable wherever an ID is accepted
+        #[arg(long)]
+        name: Option<String>,
+        /// Override the image entrypoint (drops the image's default arguments)
+        #[arg(long)]
+        entrypoint: Option<String>,
+        /// Isolation mode (default: chosen from host and image compatibility)
+        #[arg(long, value_enum)]
+        isolation: Option<Isolation>,
         /// Force a tty (default: auto-detect from stdin/stdout)
         #[arg(long, overrides_with = "no_tty")]
         tty: bool,
@@ -41,16 +48,22 @@ enum Command {
         no_tty: bool,
         /// Image reference
         image: String,
-        /// Command line to run inside the container
-        #[arg(trailing_var_arg = true, default_values_t = ["cmd.exe".to_string()])]
+        /// Command and arguments (default: the image's entrypoint and command)
+        #[arg(trailing_var_arg = true)]
         command: Vec<String>,
     },
     /// List containers
     #[command(visible_alias = "ls")]
-    List,
+    List {
+        #[arg(long, value_enum, default_value_t = Format::Table)]
+        format: Format,
+    },
     /// Delete a container and its scratch layer
     #[command(visible_alias = "rm")]
-    Delete { id: String },
+    Delete {
+        /// Container ID, unique ID prefix, or name
+        container: String,
+    },
     /// Manage images
     Image {
         #[command(subcommand)]
@@ -70,23 +83,52 @@ enum ImageCommand {
     },
     /// List local images
     #[command(visible_alias = "ls")]
-    List,
+    List {
+        #[arg(long, value_enum, default_value_t = Format::Table)]
+        format: Format,
+    },
     /// Delete a local image record
     #[command(visible_alias = "rm")]
     Delete { image: String },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Isolation {
     Process,
+    // Hidden until utility VM support lands.
+    #[value(hide = true)]
     Hyperv,
 }
 
-fn main() -> Result<()> {
+#[derive(Clone, Copy, ValueEnum)]
+pub enum Format {
+    Table,
+    Json,
+}
+
+/// Exit code for failures of winner itself under `run`, so they can be told
+/// apart from the container process's own exit code.
+const RUN_FAILURE: i32 = 125;
+
+fn main() {
     let cli = Cli::parse();
-    match cli.command {
+    let failure = if matches!(cli.command, Command::Run { .. }) { RUN_FAILURE } else { 1 };
+    match dispatch(cli.command) {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            std::process::exit(failure);
+        }
+    }
+}
+
+fn dispatch(command: Command) -> Result<i32> {
+    match command {
         Command::Run {
-            rm,
+            remove,
+            name,
+            entrypoint,
             isolation,
             tty,
             no_tty,
@@ -98,16 +140,17 @@ fn main() -> Result<()> {
                 (_, true) => Some(false),
                 _ => None,
             };
-            let code = run::run(&image, &command, isolation, tty, rm)?;
-            std::process::exit(code as i32);
+            let opts = run::Options { name, entrypoint, isolation, tty, remove };
+            run::run(&image, &command, opts).map(|code| code as i32)
         }
-        Command::List => state::list(),
-        Command::Delete { id } => run::remove(&id),
+        Command::List { format } => state::list(format).map(|()| 0),
+        Command::Delete { container } => run::remove(&container).map(|()| 0),
         Command::Image { command } => match command {
             ImageCommand::Pull { image } => pull::pull(&image),
-            ImageCommand::List => image::list(),
+            ImageCommand::List { format } => image::list(format),
             ImageCommand::Delete { image } => image::delete(&image),
-        },
-        Command::Shim { id } => shim::main(&id),
+        }
+        .map(|()| 0),
+        Command::Shim { id } => shim::main(&id).map(|()| 0),
     }
 }
