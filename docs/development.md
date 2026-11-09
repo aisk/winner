@@ -3,18 +3,27 @@
 ## Architecture
 
 ```
-main.rs    CLI (clap)
-pull.rs    registry pull; the only place tokio is used (current_thread + block_on)
-image.rs   local image records
-layer/     layer import and scratch layer mount
-  import.rs  tar -> base layer, port of hcsshim baseLayerWriter + go-winio backuptar
-backup.rs  Win32 backup stream encoding, privileges, FILETIME helpers
-hcs.rs     synchronous wrappers over computecore.dll (HCS v2)
-run.rs     foreground lifecycle: scratch -> mount -> create -> start -> exec -> wait
-stdio.rs   one blocking thread per stream; raw VT console for ttys
-state.rs   container state in %ProgramData%\winner\containers\<id>\state.json
-shim.rs    planned per-container supervisor for `run -d`
+main.rs     CLI (clap)
+pull.rs     registry pull; the only place tokio is used (current_thread + block_on)
+image.rs    local image records, reference matching, layer garbage collection
+layer/      layer import and scratch layer mount
+  import.rs   tar -> backup streams (go-winio backuptar), base layer writer
+  legacy.rs   non-base layers: hcsshim legacyLayerWriter + vmcompute ImportLayer
+backup.rs   Win32 backup stream encoding, privileges, FILETIME helpers
+hcs.rs      synchronous wrappers over computecore.dll (HCS v2)
+run.rs      create, run, start; `execute` supervises one run of a container
+control.rs  stop, kill, exec, logs, inspect, delete (by container ID via vmcompute)
+shim.rs     detached supervisor: `execute` with output to the container log
+stdio.rs    one blocking thread per stream; raw VT console for ttys
+state.rs    container state in %ProgramData%\winner\containers\<id>\state.json
 ```
+
+A container run is always supervised by exactly one process holding the
+only compute system handle (`ShouldTerminateOnLastHandleClosed`): the
+foreground `run`, or a detached `winner shim <id>` that `start` / `run -d`
+spawn and then wait on until the state leaves `created`. The supervisor
+records `running` and the exit code; if it dies, vmcompute tears the
+container down and the next state read reconciles the record.
 
 There is no daemon. `vmcompute` (the system HCS service) owns container
 lifetimes; winner keeps its own state on disk.
@@ -71,8 +80,23 @@ Paths are validated so nothing escapes the layer root: no `..`, no drive or
 stream syntax, and no traversal through a reparse point created earlier in
 the same layer.
 
-Non-base layers need hcsshim's `legacyLayerWriter` (staging directory,
-`tombstones.txt`, then vmcompute `ImportLayer`); not ported yet.
+Non-base layers follow hcsshim's `legacyLayerWriter`: entries are staged in
+`%ProgramData%\winner\tmp\import-*` in the transport format vmcompute
+`ImportLayer(info, layerPath, stagingPath, parents topmost first)` consumes:
+
+- `Files\...`: a plain file holding the attributes (u32 LE) followed by the
+  raw backup stream; directories also get a `<name>.$wcidirs$` file in that
+  format. Directory reparse points are staged without the placeholder
+  directory (recreated just before import) so nothing lands inside them.
+- `Hives\...`: restored with `BackupWrite`, security processing off.
+- Staged files carry the entry's times with the attributes cleared.
+
+`ImportLayer` cannot express whiteouts or hard links, so afterwards
+(`legacyLayerWriterWrapper.Close`): whiteouts are removed from the new layer,
+hard links are created (target in this layer if it was added here, otherwise
+the topmost parent that has it), and directory times are re-applied because
+both steps bump them. UtilityVM content in non-base layers is not supported
+yet (only needed for Hyper-V isolation).
 
 ## Environment pitfalls
 
@@ -111,10 +135,39 @@ Non-base layers need hcsshim's `legacyLayerWriter` (staging directory,
   image-provided parts are joined verbatim; only user-supplied arguments are
   quoted.
 
+- **Stale "running" records**: the compute system is created with
+  `ShouldTerminateOnLastHandleClosed`, so a killed CLI takes its container
+  down with it but leaves `status: running` on disk (and the scratch layer
+  mounted). Reading container state reconciles it with
+  `HcsEnumerateComputeSystems` (needs elevation; skipped otherwise), and
+  `delete` unmounts before destroying the scratch layer. The reconciled
+  status is never written back: the supervisor is the only writer of
+  state.json, and a read-modify-write from `list` / `inspect` once wiped the
+  error a failing shim had just recorded.
+- **When a container counts as running**: only after `HcsCreateProcess`
+  succeeds. Marking it right after the compute system starts made `start`
+  report success for a process that then failed to launch.
+- **Concurrent delete**: `delete --force` can remove a container directory
+  while its `run` process is still finishing. `ContainerState::save` only
+  creates the directory for a new container, so the late write is dropped
+  instead of resurrecting a half-deleted container.
+
+- **Handle inheritance when spawning the shim**: `CreateProcess` runs with
+  inheritance on, so the shim would inherit winner's own stdio when it is an
+  inheritable pipe (a script capturing `run -d` output) and the caller would
+  wait until the container exits. `spawn_shim` marks the standard handles
+  non-inheritable first. It also asks for `CREATE_BREAKAWAY_FROM_JOB` in case
+  the terminal or sudo kills its job on exit.
+- **Image user**: Windows images set `User` (nanoserver: `ContainerUser`).
+  It goes into `ProcessParameters.User`; without it processes run as
+  `ContainerAdministrator`.
+
 ## Debugging
 
 - Run the built exe elevated rather than `sudo cargo run`, so `target/`
   is not populated with files owned by an elevated token.
+- `scripts/e2e.ps1` runs every end-to-end check under one elevation
+  (`sudo pwsh -NoProfile -File scripts/e2e.ps1 [-Full] [-Only <case>]`).
 - `WINNER_KEEP_FAILED=1` keeps a partially imported layer on disk instead of
   destroying it (use `sudo --preserve-env`).
 - hcsshim (`internal/wclayer`, `internal/layers/wcow_mount.go`,
