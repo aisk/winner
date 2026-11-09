@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use windows::Win32::Foundation::{HLOCAL, LocalFree};
 use windows::Win32::System::HostComputeSystem::*;
-use windows::core::{HSTRING, PWSTR};
+use windows::core::{HSTRING, PCWSTR, PWSTR};
 
 const INFINITE: u32 = u32::MAX;
 
@@ -37,8 +37,12 @@ impl Operation {
     }
 
     fn wait(&self) -> Result<Option<String>> {
+        self.wait_timeout(INFINITE)
+    }
+
+    fn wait_timeout(&self, millis: u32) -> Result<Option<String>> {
         let mut doc = PWSTR::null();
-        let r = unsafe { HcsWaitForOperationResult(self.0, INFINITE, Some(&mut doc)) };
+        let r = unsafe { HcsWaitForOperationResult(self.0, millis, Some(&mut doc)) };
         let doc = take_doc(doc);
         r.map(|()| doc.clone()).map_err(|e| with_doc(e, doc))
     }
@@ -60,6 +64,19 @@ impl Drop for Operation {
     }
 }
 
+/// IDs of compute systems that vmcompute reports as running.
+pub fn running_systems() -> Result<std::collections::HashSet<String>> {
+    let op = Operation::new();
+    unsafe { HcsEnumerateComputeSystems(&HSTRING::from("{}"), op.0) }.context("HcsEnumerateComputeSystems")?;
+    let doc = op.wait().context("enumerate compute systems")?.unwrap_or_default();
+    let systems: Vec<serde_json::Value> = if doc.is_empty() { Vec::new() } else { serde_json::from_str(&doc)? };
+    Ok(systems
+        .into_iter()
+        .filter(|s| s["State"] == "Running")
+        .filter_map(|s| s["Id"].as_str().map(Into::into))
+        .collect())
+}
+
 /// A handle to a compute system. Dropping it only closes the handle; the
 /// system itself keeps running inside vmcompute until terminated.
 pub struct System(HCS_SYSTEM);
@@ -79,7 +96,6 @@ impl System {
         Ok(system)
     }
 
-    #[allow(dead_code)] // used by ps/rm/shim once implemented
     pub fn open(id: &str) -> Result<Self> {
         const GENERIC_ALL: u32 = 0x1000_0000;
         let handle = unsafe { HcsOpenComputeSystem(&HSTRING::from(id), GENERIC_ALL) }
@@ -91,6 +107,15 @@ impl System {
         let op = Operation::new();
         unsafe { HcsStartComputeSystem(self.0, op.0, None) }.context("HcsStartComputeSystem")?;
         op.wait().context("start compute system")?;
+        Ok(())
+    }
+
+    /// Ask the container to shut down cleanly, waiting at most `timeout`.
+    pub fn shutdown(&self, timeout: std::time::Duration) -> Result<()> {
+        let op = Operation::new();
+        unsafe { HcsShutDownComputeSystem(self.0, op.0, PCWSTR::null()) }.context("HcsShutDownComputeSystem")?;
+        let millis = u32::try_from(timeout.as_millis()).unwrap_or(INFINITE - 1);
+        op.wait_timeout(millis).context("shut down compute system")?;
         Ok(())
     }
 

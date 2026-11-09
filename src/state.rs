@@ -1,9 +1,11 @@
 //! Container state persisted on disk. There is no daemon, so this file is
 //! the only record of a container besides what vmcompute tracks.
 
+use crate::spec::MappedDirectory;
 use crate::{Format, Isolation, paths, table};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
@@ -24,8 +26,33 @@ pub struct ContainerState {
     pub isolation: Isolation,
     pub status: Status,
     pub exit_code: Option<u32>,
+    /// Why the last start failed, for containers started in the background.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Seconds since the Unix epoch.
+    #[serde(default)]
+    pub created: u64,
     /// Imported layer directories, base first.
     pub layers: Vec<PathBuf>,
+    /// The process to start, resolved from the image and options at create time.
+    #[serde(default)]
+    pub process: ProcessConfig,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<MappedDirectory>,
+    /// Delete the container once it exits.
+    #[serde(default)]
+    pub remove: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct ProcessConfig {
+    pub command_line: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 }
 
 impl ContainerState {
@@ -37,8 +64,23 @@ impl ContainerState {
         self.dir().join("scratch")
     }
 
+    /// Output of a container started in the background.
+    pub fn log(&self) -> PathBuf {
+        self.dir().join("log")
+    }
+
+    pub fn is_running(&self) -> bool {
+        matches!(self.status, Status::Running)
+    }
+
     pub fn save(&self) -> Result<()> {
-        std::fs::create_dir_all(self.dir())?;
+        if matches!(self.status, Status::Created) {
+            std::fs::create_dir_all(self.dir())?;
+        } else if !self.dir().exists() {
+            // Deleted (`delete --force`) while this process still held it;
+            // writing now would resurrect a container without a scratch layer.
+            return Ok(());
+        }
         let tmp = self.dir().join("state.json.tmp");
         std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
         std::fs::rename(tmp, self.dir().join("state.json"))?;
@@ -56,6 +98,10 @@ impl ContainerState {
 pub const SHORT_ID: usize = 12;
 
 /// A new container ID: 32 lowercase hex digits.
+pub fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
 pub fn new_id() -> Result<String> {
     Ok(format!("{:032x}", windows::core::GUID::new()?.to_u128()))
 }
@@ -73,14 +119,38 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// All containers with a readable state file.
+/// All containers with a readable state file, reconciled with vmcompute.
 pub fn all() -> Vec<ContainerState> {
     let Ok(dir) = std::fs::read_dir(paths::containers()) else {
         return Vec::new();
     };
-    dir.flatten()
+    let mut states: Vec<_> = dir
+        .flatten()
         .filter_map(|e| ContainerState::load(&e.file_name().to_string_lossy()).ok())
-        .collect()
+        .collect();
+    reconcile(&mut states);
+    states.sort_by_key(|s| s.created);
+    states
+}
+
+/// A record left "running" by a supervisor that was killed has no compute
+/// system behind it anymore (it is terminated when the last handle closes).
+/// Report it as exited, with an unknown exit code.
+///
+/// Only the in-memory copy changes: the supervisor is the sole writer of
+/// state.json, and writing back here could overwrite what it records in the
+/// meantime (such as the error of a failed start).
+fn reconcile(states: &mut [ContainerState]) {
+    if !states.iter().any(|s| matches!(s.status, Status::Running)) {
+        return;
+    }
+    // Enumeration needs elevation; without it keep the recorded status.
+    let Ok(live) = crate::hcs::running_systems() else { return };
+    for s in states.iter_mut() {
+        if matches!(s.status, Status::Running) && !live.contains(&s.id) {
+            s.status = Status::Exited;
+        }
+    }
 }
 
 /// Find a container by full ID, name, or unique ID prefix.

@@ -36,6 +36,36 @@ pub fn forward(stdio: Stdio, on_stdin_eof: impl FnOnce() + Send + 'static) -> Ve
     out
 }
 
+/// Append the container's stdout and stderr to `log` (detached containers).
+/// Returns the copy threads, which finish when the container closes its pipes.
+pub fn forward_to_log(stdio: Stdio, log: File) -> Vec<JoinHandle<()>> {
+    let log = std::sync::Arc::new(std::sync::Mutex::new(log));
+    [stdio.stdout, stdio.stderr]
+        .into_iter()
+        .flatten()
+        .map(|h| {
+            let log = log.clone();
+            std::thread::spawn(move || {
+                let _ = copy_flushing(File::from(h), LockedWriter(&log));
+            })
+        })
+        .collect()
+}
+
+/// Writes whole chunks under the lock so stdout and stderr interleave by chunk.
+struct LockedWriter<'a>(&'a std::sync::Mutex<File>);
+
+impl Write for LockedWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn copy_flushing(mut from: File, mut to: impl Write) -> io::Result<()> {
     use std::io::Read;
     let mut buf = [0u8; 8192];

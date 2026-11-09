@@ -9,15 +9,16 @@ use oci_client::manifest::{ImageIndexEntry, OciDescriptor};
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 
-pub fn pull(reference: &str) -> Result<()> {
+/// Pull an image and import its layers. Progress goes to stderr.
+pub fn pull(reference: &str) -> Result<ImageRecord> {
+    let reference = &normalize(reference)?;
     // Layer import needs these; fail before downloading hundreds of MB.
     crate::backup::enable_privileges(&["SeBackupPrivilege", "SeRestorePrivilege"])?;
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let record = rt.block_on(fetch(reference))?;
     import_layers(&record)?;
     record.save()?;
-    println!("{}: {}", record.reference, record.manifest_digest);
-    Ok(())
+    Ok(record)
 }
 
 /// Pick the manifest whose os.version best matches the host build: an exact
@@ -65,7 +66,7 @@ async fn fetch(reference: &str) -> Result<ImageRecord> {
     }
 
     Ok(ImageRecord {
-        reference: normalize(reference),
+        reference: reference.to_string(),
         manifest_digest: digest,
         os_version: config["os.version"].as_str().map(Into::into),
         layers: manifest.layers.iter().map(|l| l.digest.clone()).collect(),

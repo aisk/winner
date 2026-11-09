@@ -2,7 +2,7 @@
 //!
 //! Reference: https://learn.microsoft.com/virtualization/api/hcs/schemareference
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Clone, Copy)]
 #[serde(rename_all = "PascalCase")]
@@ -50,7 +50,7 @@ pub struct Storage {
     pub path: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "PascalCase")]
 pub struct MappedDirectory {
     pub host_path: String,
@@ -66,6 +66,9 @@ pub struct ProcessParameters {
     pub working_directory: Option<String>,
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub environment: std::collections::BTreeMap<String, String>,
+    /// Account inside the container, e.g. `ContainerUser`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
     /// Use ConPTY inside the container; stdout and stderr are merged.
     pub emulate_console: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
