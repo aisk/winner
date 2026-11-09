@@ -17,6 +17,8 @@ $ErrorActionPreference = 'Stop'
 $Winner = (Resolve-Path $Winner).Path
 $Nano = 'mcr.microsoft.com/windows/nanoserver:ltsc2025'
 $Dotnet = 'mcr.microsoft.com/dotnet/runtime:10.0-nanoserver-ltsc2025'
+# ASP.NET sample app, listens on port 8080.
+$Web = 'mcr.microsoft.com/dotnet/samples:aspnetapp-nanoserver-ltsc2025'
 $Log = Join-Path $PSScriptRoot '..\target\e2e.log'
 
 $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -103,6 +105,15 @@ function WaitUntil([scriptblock]$Cond, [int]$Seconds = 30) {
     $false
 }
 
+# Names of HNS endpoints winner created (winner-<container id>).
+function Endpoints {
+    @(hnsdiag list endpoints | Select-String -Pattern 'Name\s*:\s*(winner-[0-9a-f]{32})' | ForEach-Object { $_.Matches[0].Groups[1].Value })
+}
+
+function HttpStatus([string]$Url) {
+    try { (Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 $Url).StatusCode } catch { 0 }
+}
+
 function Cleanup {
     try {
         $r = W @('list', '--format', 'json')
@@ -111,6 +122,7 @@ function Cleanup {
                 if ($c.name -like 'e2e-*') { W @('delete', '--force', $c.id) | Out-Null }
             }
         }
+        W @('network', 'delete', 'e2e-net') | Out-Null
     } catch {
         Say "cleanup failed: $_" 'Yellow'
     }
@@ -260,8 +272,86 @@ Case 'orphan' {
     Check 'shim process found' ([bool]$shim)
     if ($shim) { Stop-Process -Id $shim.ProcessId -Force }
     Check 'killed supervisor is noticed as exited' (WaitUntil { (State 'e2e-orphan').status -eq 'exited' })
+    Check 'its endpoint is left behind' ((Endpoints) -contains "winner-$id")
+    $r = W @('start', 'e2e-orphan')
+    Check 'it starts again (stale mount and endpoint replaced)' ($r.Code -eq 0 -and (State 'e2e-orphan').status -eq 'running') $r
+    W @('kill', 'e2e-orphan') | Out-Null
     $r = W @('delete', 'e2e-orphan')
     Check 'delete without --force' ($r.Code -eq 0) $r
+    Check 'no endpoint is left' (-not ((Endpoints) -contains "winner-$id"))
+}
+
+# --- networking ------------------------------------------------------------
+
+Case 'network' {
+    $r = W @('run', '--remove', $Nano, 'ipconfig')
+    Check 'default network gives an IPv4 address' ($r.Code -eq 0 -and $r.Out -match 'IPv4 Address') $r
+    $r = W @('network', 'list', '--format', 'json')
+    Check 'the winner network exists' ($r.Code -eq 0 -and (($r.Out | ConvertFrom-Json).Name -contains 'winner')) $r
+    $r = W @('run', '--remove', $Nano, 'curl.exe', '-sS', '-o', 'NUL', '-w', '%{http_code}', 'https://mcr.microsoft.com/v2/') -Timeout 60
+    Check 'DNS and outbound HTTPS' ($r.Code -eq 0 -and $r.Out -match '^(200|401)$') $r
+    $r = W @('run', '--remove', '--network', 'none', $Nano, 'ipconfig')
+    Check '--network none has no adapter' ($r.Code -eq 0 -and $r.Out -notmatch 'IPv4 Address') $r
+    $hostIp = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.AddressState -eq 'Preferred' } | Select-Object -First 1).IPAddress
+    $r = W @('run', '--remove', '--network', 'host', $Nano, 'ipconfig')
+    Check '--network host sees the host adapters' ($r.Code -eq 0 -and $r.Out -match [regex]::Escape($hostIp)) $r
+    $r = W @('run', '--remove', '--network', 'host', $Nano, 'ipconfig')
+    Check '--network host again (host namespace survives)' ($r.Code -eq 0 -and $r.Out -match [regex]::Escape($hostIp)) $r
+    $r = W @('create', '--network', 'none', '-p', '18080:8080', $Nano)
+    Check '--publish with --network none is refused' ($r.Code -ne 0) $r
+    $r = W @('create', '--network', 'host', '-p', '18080:8080', $Nano)
+    Check '--publish with --network host is refused' ($r.Code -ne 0) $r
+    $r = W @('create', '-p', '18080', $Nano)
+    Check 'malformed --publish is refused' ($r.Code -ne 0) $r
+    $r = W @('create', '--network', 'e2e-missing', $Nano)
+    Check 'unknown network is refused' ($r.Code -ne 0 -and $r.Err -match 'not found') $r
+}
+
+Case 'publish' {
+    $r = W @('image', 'pull', $Web) -Timeout 1800
+    Check 'pull the web sample' ($r.Code -eq 0) $r
+    $r = W @('run', '-d', '--name', 'e2e-web', '-p', '18080:8080', $Web)
+    Check 'run -d --publish' ($r.Code -eq 0) $r
+    Check 'reachable on localhost' (WaitUntil { (HttpStatus 'http://localhost:18080/') -eq 200 } 60)
+    $ip = (State 'e2e-web').endpoint.ip_address
+    Check 'inspect shows the endpoint' ([bool]$ip)
+    Check 'reachable on the container IP' ((HttpStatus "http://${ip}:8080/") -eq 200)
+    $r = W @('list')
+    Check 'list shows the ports' ($r.Out -match '18080->8080/tcp') $r
+    $r = W @('run', '--remove', $Nano, 'curl.exe', '-sS', '-o', 'NUL', '-w', '%{http_code}', "http://${ip}:8080/")
+    Check 'container to container' ($r.Out -match '^200$') $r
+    $r = W @('run', '-d', '--name', 'e2e-web2', '-p', '18080:8080', $Web)
+    Check 'a host port already published is refused' ($r.Code -ne 0) $r
+    W @('delete', '--force', 'e2e-web2') | Out-Null
+    $r = W @('delete', '--force', 'e2e-web')
+    Check 'delete --force' ($r.Code -eq 0) $r
+    Check 'no endpoint is left' ((Endpoints).Count -eq 0)
+    Check 'port is released' ((HttpStatus 'http://localhost:18080/') -eq 0)
+}
+
+Case 'network-manage' {
+    $r = W @('network', 'create', '--subnet', '172.31.250.0/24', 'e2e-net')
+    Check 'network create' ($r.Code -eq 0) $r
+    $r = W @('network', 'create', 'e2e-net')
+    Check 'duplicate network name is refused' ($r.Code -ne 0) $r
+    $r = W @('network', 'list')
+    Check 'network list shows it as owned by winner' ($r.Out -match 'e2e-net\s+NAT\s+172\.31\.250\.0/24\s+winner') $r
+    $r = W @('run', '--remove', '--network', 'e2e-net', $Nano, 'ipconfig')
+    Check 'container gets an address in its subnet' ($r.Code -eq 0 -and $r.Out -match '172\.31\.250\.') $r
+    W @('run', '-d', '--name', 'e2e-onnet', '--network', 'e2e-net', $Nano, 'ping', '-n', '120', '127.0.0.1') | Out-Null
+    $r = W @('network', 'delete', 'e2e-net')
+    Check 'network in use is not deleted' ($r.Code -ne 0 -and $r.Err -match 'in use') $r
+    W @('delete', '--force', 'e2e-onnet') | Out-Null
+    $r = W @('network', 'delete', 'e2e-net')
+    Check 'network delete' ($r.Code -eq 0) $r
+    $r = W @('network', 'list')
+    Check 'it is gone' ($r.Out -notmatch 'e2e-net') $r
+    $r = W @('network', 'create', 'host')
+    Check 'reserved names are refused' ($r.Code -ne 0) $r
+    if ((W @('network', 'list')).Out -match 'Default Switch') {
+        $r = W @('network', 'delete', 'Default Switch')
+        Check 'networks of other tools are not deleted' ($r.Code -ne 0 -and $r.Err -match 'not created by winner') $r
+    }
 }
 
 # --- non-base layers -------------------------------------------------------
