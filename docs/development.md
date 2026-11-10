@@ -17,6 +17,8 @@ run.rs      create, run, start; `execute` supervises one run of a container
 control.rs  stop, kill, exec, logs, inspect, delete (by container ID via vmcompute)
 shim.rs     detached supervisor: `execute` with output to the container log
 stdio.rs    one blocking thread per stream; raw VT console for ttys
+system.rs   system prune
+lock.rs     file locks from share modes (supervisor, store, import)
 state.rs    container state in %ProgramData%\winner\containers\<id>\state.json
 ```
 
@@ -37,6 +39,10 @@ blobs/<algo>/<hex>          downloaded layer blobs
 layers/<algo>-<hex>/        imported read-only layers
 images/<escaped-ref>.json   image records
 containers/<id>/            state.json, scratch/, log, supervisor.lock
+tmp/import-*/               staging of non-base layer imports
+tmp/importing-<algo>-<hex>  marker: that layer's import has not finished
+store.lock                  pulls (shared) vs. garbage collection (exclusive)
+import.lock                 one layer import at a time
 ```
 
 ## System resources: ownership and cleanup
@@ -58,16 +64,57 @@ state.json:
    succeeds.
 3. **Sweeping.** Before connecting a container, `network::sweep` enumerates
    HNS endpoints named `winner-<32 hex>` whose ID matches the derived one and
-   releases those whose container has no live supervisor.
+   releases those whose container nobody holds the lock of.
 
-"Live supervisor" is decided by `supervisor.lock`: the supervisor (`run` in
-the foreground, or `winner shim`) holds it open without read sharing for as
-long as it runs, so opening it fails with a sharing violation exactly while
-the supervisor is alive. Unlike `status` in state.json this cannot go stale.
-It also stops two supervisors from running the same container.
+Who may touch a container's resources is decided by `supervisor.lock`
+(`src/lock.rs`): it is held, without read or write sharing, by
+
+- the supervisor (`run` in the foreground, or `winner shim`) for as long as
+  it runs, including releasing the network and scratch layer after the exit
+  is recorded;
+- `create`, from before state.json is written until the caller starts the
+  container (so `system prune` cannot delete a container being created);
+- `system prune` and `network::sweep` while they release a container's
+  resources. Checking "no supervisor" and then releasing would race a
+  supervisor starting in between; taking the lock makes it atomic.
+
+Opening the file fails with a sharing violation exactly while someone holds
+it, and Windows drops the lock with the process. Unlike `status` in
+state.json it cannot go stale. `stop` and `kill` wait until the lock is
+free, not just until the status says exited, so a following `start` or
+`delete` does not collide with the supervisor's cleanup; a shim that finds
+the lock taken waits a few seconds for that cleanup before giving up.
 
 The namespace is deleted before the endpoint: a leftover endpoint is found
 again by name, a namespace has no name.
+
+Layers have the same problem in another shape: a pull imports layers before
+it writes the image record that references them, so garbage collection
+running meanwhile would see them as unused. `store.lock` is a reader-writer
+lock built from share modes: pulls open it sharing read and write (several
+pulls coexist), garbage collection opens it sharing nothing. Collection
+skips its turn while a pull runs; a pull waits while collection runs. With
+the exclusive lock held, `tmp/import-*` directories are leftovers of
+interrupted imports and are removed too.
+
+A layer directory is complete only if no `tmp/importing-*` marker names it:
+the marker is written before the import and removed after, so a pull killed
+mid-import leaves it behind and the next pull (or garbage collection)
+destroys the half-written layer instead of taking it as done. The marker
+lives outside the layer directory because vmcompute owns that layout.
+`import.lock` serializes imports across processes (two pulls sharing a
+layer would write the same directory); downloads go to a per-process
+`.partial-<pid>` file and are renamed into place.
+
+Garbage collection gives up if any image record or container state cannot
+be read: the layers it references would look unused. Image records and
+state files are written to a temp file and renamed, so a crash cannot leave
+a truncated one.
+
+`system prune` applies all of this at once: containers without a live
+supervisor, the network objects `sweep` finds, networks winner created that
+no remaining container names, unreferenced layers and blobs, and with
+`--all` images no remaining container uses.
 
 ## Which APIs, and why
 
@@ -202,6 +249,12 @@ Details that matter:
   `{"Operation":"CloseHandle","CloseHandle":{"Handle":"StdIn"}}` after the
   copy finishes (hcsshim's `CloseStdin`), or `echo x | winner run ... cmd`
   hangs forever.
+- **Console size**: with a tty, the host console size is polled every
+  200 ms and changes are sent as `HcsModifyProcess`
+  `{"Operation":"ConsoleSize","ConsoleSize":{"Height":..,"Width":..}}`
+  (hcsshim `ResizeConsole`). Polling, because the stdin thread already
+  consumes the console input, window-size events included. nanoserver has no
+  `mode` command to check the size from inside.
 - **`cmd /c` quoting**: cmd does not parse its command line with the MSVCRT
   rules, so an argument ending in a backslash (`"... dir C:\"`) arrives with
   the backslash doubled. Pass such commands as separate arguments.
@@ -217,9 +270,10 @@ Details that matter:
   mounted). Reading container state reconciles it with
   `HcsEnumerateComputeSystems` (needs elevation; skipped otherwise), and
   `delete` unmounts before destroying the scratch layer. The reconciled
-  status is never written back: the supervisor is the only writer of
-  state.json, and a read-modify-write from `list` / `inspect` once wiped the
-  error a failing shim had just recorded.
+  status is never written back: while a container runs, its supervisor is
+  the only writer of state.json (`create` and `start` write it only before a
+  supervisor exists), and a read-modify-write from `list` / `inspect` once
+  wiped the error a failing shim had just recorded.
 - **Restart after a killed supervisor**: the scratch layer is still
   activated, and `ActivateLayer` fails with a sharing violation (0x80070020).
   `execute` unmounts first; the supervisor lock guarantees no live run uses it.
@@ -227,9 +281,20 @@ Details that matter:
   succeeds. Marking it right after the compute system starts made `start`
   report success for a process that then failed to launch.
 - **Concurrent delete**: `delete --force` can remove a container directory
-  while its `run` process is still finishing. `ContainerState::save` only
-  creates the directory for a new container, so the late write is dropped
-  instead of resurrecting a half-deleted container.
+  while its `run` process is still finishing. Only `create` makes the
+  directory; `ContainerState::save` drops the write when it is gone, so a
+  late write (or a racing `start`) cannot resurrect a half-deleted container.
+- **Ctrl+C in the foreground**: by default it kills winner, and with it the
+  container (last handle closed), but skips recording the exit, releasing
+  the network and scratch layer, and `--remove`. `run` installs a console
+  control handler that terminates the container instead and lets `execute`
+  finish; the exit code is `0xC000013A` as for any Ctrl+C'd program (HCS
+  itself reports `0xC0000001` for a process of a terminated container). With
+  a tty, Ctrl+C is input for the container and only Ctrl+Break reaches the
+  handler. `exec` does not install one yet. Testing it: a process started
+  with `Start-Process` may have Ctrl+C ignored, and events generated after
+  `AttachConsole` to another process's console never arrived; the e2e case
+  starts winner from a helper in the same console and sends Ctrl+Break.
 
 - **Handle inheritance when spawning the shim**: `CreateProcess` runs with
   inheritance on, so the shim would inherit winner's own stdio when it is an

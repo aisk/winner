@@ -50,6 +50,8 @@ winner network create --subnet 172.30.0.0/24 backend
 winner run --remove --network backend nanoserver:ltsc2025 ipconfig
 winner network list
 
+winner system prune
+
 winner create --name later nanoserver:ltsc2025 cmd /c echo hi
 winner start later
 winner list
@@ -90,6 +92,11 @@ as aliases for `list` and `delete`. A tty is detected automatically;
 - `--publish HOST:CONTAINER[/udp]` (`-p`) maps a host port; it is reachable
   on `localhost` and the host's addresses. `inspect` shows a running
   container's IP address.
+- With a tty, resizing the terminal window resizes the container's console.
+- `system prune` deletes containers that are not running, networks winner
+  created that no container needs anymore, unused layers and leftovers of
+  interrupted operations, and reports the space reclaimed. `--all` also
+  deletes images no container uses. It asks first; `--force` skips that.
 - `network create|list|inspect|delete` manages NAT networks. `network list`
   also shows networks of other tools (such as `Default Switch`); only
   networks winner created can be deleted.
@@ -123,6 +130,7 @@ Results are also written to `target\e2e.log`.
 - [x] Non-base layer import
 - [x] Detached containers, logs, exec, stop / kill
 - [x] Networking (HCN): NAT, published ports, host and none modes
+- [x] Console resize forwarding, `system prune`
 - [ ] Hyper-V isolation
 
 See [docs/development.md](docs/development.md) for design notes.
