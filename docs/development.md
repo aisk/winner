@@ -247,8 +247,9 @@ reason to rely on that. So:
   supervisor then shuts it down. Terminating the system stays the fallback.
 - `IgnoreFlushesDuringBoot` is set only on the first start (`started` in
   state.json), as Docker does; it saves about 0.2s of a 1.5s start.
-- `HcsStartComputeSystem` is waited on for at most 4 minutes (hcsshim's
-  limit) so a VM that cannot boot fails the start instead of hanging it.
+- Every HCS operation is waited on for at most 4 minutes (hcsshim's
+  default), so a VM that cannot boot fails the start instead of hanging it.
+  Only waiting for a process to exit is unbounded.
 
 A supervisor killed during the first run still loses the container (the
 last handle closes and vmcompute terminates the system).
@@ -373,10 +374,14 @@ Details that matter:
   finish; the exit code is `0xC000013A` as for any Ctrl+C'd program (HCS
   itself reports `0xC0000001` for a process of a terminated container). With
   a tty, Ctrl+C is input for the container and only Ctrl+Break reaches the
-  handler. `exec` does not install one yet. Testing it: a process started
-  with `Start-Process` may have Ctrl+C ignored, and events generated after
-  `AttachConsole` to another process's console never arrived; the e2e case
-  starts winner from a helper in the same console and sends Ctrl+Break.
+  handler. `exec` installs the same handler but ends only its own process:
+  without it the exec'd process kept running in the container after winner
+  died. Testing it: a process started with `Start-Process` may have Ctrl+C
+  ignored, and events generated after `AttachConsole` to another process's
+  console never arrived; the e2e case starts winner from a helper in the
+  same console and sends Ctrl+Break. Nano Server has no `tasklist`, but
+  process-isolated container processes are visible on the host
+  (`Win32_Process`).
 
 - **Handle inheritance when spawning the shim**: `CreateProcess` runs with
   inheritance on, so the shim would inherit winner's own stdio when it is an
@@ -384,6 +389,11 @@ Details that matter:
   wait until the container exits. `spawn_shim` marks the standard handles
   non-inheritable first. It also asks for `CREATE_BREAKAWAY_FROM_JOB` in case
   the terminal or sudo kills its job on exit.
+- **HCN "not found"**: there is no single error code for it (each kind has
+  its own, some none), so `hcn::get` opens the object and, only if that
+  fails, enumerates to check whether it still exists: gone means `None`,
+  anything else is an error. Treating every open failure as "not found" hid
+  real failures (an unreachable HNS looked like "no endpoint").
 - **Image user**: Windows images set `User` (nanoserver: `ContainerUser`).
   It goes into `ProcessParameters.User`; without it processes run as
   `ContainerAdministrator`.
