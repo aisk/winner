@@ -5,12 +5,23 @@ use crate::hcs::System;
 use crate::image::ImageRecord;
 use crate::process::{merge_env, quote_arg};
 use crate::spec::MappedDirectory;
-use crate::state::{self, ContainerState, ProcessConfig, Status};
+use crate::state::{self, ContainerState, Isolation, ProcessConfig, Status};
 use crate::supervisor::{self, Io};
-use crate::{Isolation, Pull, host, image, layer, network, paths, pull, stdio};
+use crate::{host, image, layer, network, paths, pull, stdio};
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+/// When `create` / `run` pull the image.
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum Pull {
+    /// Pull only if the image is not available locally
+    Missing,
+    /// Always pull, picking up a newer image under the same tag
+    Always,
+    /// Never pull; fail if the image is not available locally
+    Never,
+}
 
 /// Options shared by `create` and `run`.
 pub struct Options {

@@ -1,6 +1,14 @@
-//! Human-readable table output with columns sized to their content.
+//! Command output: human-readable tables by default, JSON for machines.
 
-pub fn print<const N: usize>(headers: [&str; N], rows: &[[String; N]]) {
+/// `--format` of the listing commands.
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum Format {
+    Table,
+    Json,
+}
+
+/// Print a table with columns sized to their content.
+pub fn table<const N: usize>(headers: [&str; N], rows: &[[String; N]]) {
     let mut widths = headers.map(str::len);
     for row in rows {
         for (w, cell) in widths.iter_mut().zip(row) {

@@ -9,6 +9,7 @@ mod image;
 mod layer;
 mod lock;
 mod network;
+mod output;
 mod paths;
 mod process;
 mod pull;
@@ -19,10 +20,12 @@ mod state;
 mod stdio;
 mod supervisor;
 mod system;
-mod table;
 
+use crate::output::Format;
+use crate::run::Pull;
+use crate::state::Isolation;
 use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(version, about = "Run Windows containers without a daemon")]
@@ -282,29 +285,6 @@ enum SystemCommand {
         #[arg(short, long)]
         force: bool,
     },
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Isolation {
-    Process,
-    Hyperv,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-pub enum Pull {
-    /// Pull only if the image is not available locally
-    Missing,
-    /// Always pull, picking up a newer image under the same tag
-    Always,
-    /// Never pull; fail if the image is not available locally
-    Never,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-pub enum Format {
-    Table,
-    Json,
 }
 
 /// Exit code for failures of winner itself under `run` and `exec`, so they

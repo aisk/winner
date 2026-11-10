@@ -3,7 +3,8 @@
 
 use crate::network::PortMapping;
 use crate::spec::MappedDirectory;
-use crate::{Format, Isolation, paths, table};
+use crate::output::{self, Format};
+use crate::paths;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -16,6 +17,16 @@ pub enum Status {
     Created,
     Running,
     Exited,
+}
+
+/// How a container is isolated from the host; chosen at `create`.
+#[derive(Clone, Copy, Debug, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Isolation {
+    /// A silo sharing the host kernel.
+    Process,
+    /// Its own kernel in a utility VM.
+    Hyperv,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -262,7 +273,7 @@ pub fn list(format: Format) -> Result<()> {
                     ]
                 })
                 .collect();
-            table::print(["ID", "NAME", "IMAGE", "STATUS", "PORTS", "COMMAND"], &rows);
+            output::table(["ID", "NAME", "IMAGE", "STATUS", "PORTS", "COMMAND"], &rows);
         }
     }
     Ok(())

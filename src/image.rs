@@ -1,6 +1,7 @@
 //! Local image records.
 
-use crate::{Format, lock, paths, table};
+use crate::output::{self, Format};
+use crate::{lock, paths};
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -304,7 +305,7 @@ pub fn list(format: Format) -> Result<()> {
                     [r.reference.clone(), r.os_version.clone().unwrap_or_else(|| "-".into()), short.into()]
                 })
                 .collect();
-            table::print(["REFERENCE", "OS VERSION", "DIGEST"], &rows);
+            output::table(["REFERENCE", "OS VERSION", "DIGEST"], &rows);
         }
     }
     Ok(())

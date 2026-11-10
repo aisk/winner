@@ -7,8 +7,8 @@
 use crate::hcs::System;
 use crate::process::{forward_console, process_parameters};
 use crate::spec::{self, ComputeSystem, Container, ContainerV1, HvRuntime, Networking, Storage};
-use crate::state::{ContainerState, Status};
-use crate::{Isolation, layer, network, stdio};
+use crate::state::{ContainerState, Isolation, Status};
+use crate::{layer, network, stdio};
 use anyhow::Result;
 use std::path::PathBuf;
 use std::time::Duration;

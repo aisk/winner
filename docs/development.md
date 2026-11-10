@@ -3,7 +3,9 @@
 ## Architecture
 
 ```
-main.rs     CLI (clap)
+main.rs     CLI (clap): command definitions and dispatch only; value types
+            the commands take live with the code that uses them
+output.rs   `--format`, human-readable tables
 pull.rs     registry pull; the only place tokio is used (current_thread + block_on)
 image.rs    local image records, reference matching, layer garbage collection
 layer/      layer import and scratch layer mount

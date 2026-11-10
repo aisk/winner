@@ -14,7 +14,8 @@
 //! container asked for.
 
 use crate::hcn::{self, Kind};
-use crate::{Format, Isolation, state, table};
+use crate::output::{self, Format};
+use crate::state::{self, Isolation};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -394,7 +395,7 @@ pub fn list(format: Format) -> Result<()> {
                     ]
                 })
                 .collect();
-            table::print(["NAME", "TYPE", "SUBNET", "OWNER"], &rows);
+            output::table(["NAME", "TYPE", "SUBNET", "OWNER"], &rows);
         }
     }
     Ok(())
