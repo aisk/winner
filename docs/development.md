@@ -92,6 +92,14 @@ state.json it cannot go stale. `stop` and `kill` wait until the lock is
 free, not just until the status says exited, so a following `start` or
 `delete` does not collide with the supervisor's cleanup; a shim that finds
 the lock taken waits a few seconds for that cleanup before giving up.
+`start` and `delete` of an exited container also wait for the lock (up to
+30s), since a container can exit on its own: the supervisor then still shuts
+the compute system down and releases network and scratch, and `logs
+--follow` has already returned. They reload the state once they have it.
+
+Image records are named after the reference with every byte other than
+`[a-z0-9.-]` written as `_xx`. The earlier scheme mapped all of them to `_`,
+so `a/b:c` and `a_b:c` (or tags differing in case, on NTFS) shared a file.
 
 The namespace is deleted before the endpoint: a leftover endpoint is found
 again by name, a namespace has no name.
