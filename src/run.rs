@@ -1,17 +1,18 @@
 //! Creating and running containers.
 //!
 //! `execute` is the supervisor for one run of a container: mount the scratch
-//! layer, create and start the compute system, run the process, wait, record
-//! the exit. It runs in the foreground `run` process with the console
+//! layer (process isolation only), create and start the compute system, run
+//! the process, wait, record the exit. It runs in the foreground `run` process with the console
 //! attached, or in a detached `winner shim` process writing to the log.
 
 use crate::hcs::System;
 use crate::image::ImageRecord;
-use crate::spec::{self, ComputeSystem, Container, MappedDirectory, Networking, ProcessParameters, Storage};
+use crate::spec::{self, ComputeSystem, Container, ContainerV1, HvRuntime, MappedDirectory, Networking, ProcessParameters, Storage};
 use crate::state::{self, ContainerState, ProcessConfig, Status};
 use crate::{Isolation, Pull, host, image, layer, network, paths, pull, stdio};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Options shared by `create` and `run`.
@@ -49,14 +50,15 @@ pub fn create(image_ref: &str, args: &[String], opts: Options) -> Result<(Contai
         (Pull::Never, None) => bail!("image {image_ref} not found locally"),
         (_, Some(local)) => local,
     };
-    let isolation = resolve_isolation(&image, opts.isolation)?;
+    let layers: Vec<PathBuf> = image.layers.iter().map(|d| paths::layer(d)).collect();
+    let isolation = resolve_isolation(&image, &layers, opts.isolation)?;
     let (command, command_line) = resolve_command(&image, opts.entrypoint.as_deref(), args)?;
     if let Some(name) = &opts.name {
         state::validate_name(name)?;
     }
     let mounts = opts.volumes.iter().map(|v| parse_volume(v)).collect::<Result<_>>()?;
     let ports: Vec<_> = opts.publish.iter().map(|p| network::parse_publish(p)).collect::<Result<_>>()?;
-    let network = network::resolve(opts.network.as_deref(), &ports)?;
+    let network = network::resolve(opts.network.as_deref(), &ports, isolation)?;
 
     let state = ContainerState {
         id: state::new_id()?,
@@ -68,7 +70,7 @@ pub fn create(image_ref: &str, args: &[String], opts: Options) -> Result<(Contai
         exit_code: None,
         error: None,
         created: state::now(),
-        layers: image.layers.iter().map(|d| paths::layer(d)).collect(),
+        layers,
         process: ProcessConfig {
             command_line,
             environment: merge_env(image.env().collect(), &opts.env)?,
@@ -79,6 +81,8 @@ pub fn create(image_ref: &str, args: &[String], opts: Options) -> Result<(Contai
         network,
         ports,
         remove: opts.remove,
+        started: false,
+        pid: None,
     };
     std::fs::create_dir_all(state.dir())?;
     let lock = state.lock_supervisor(Duration::ZERO)?;
@@ -195,64 +199,99 @@ fn spawn_shim(id: &str) -> Result<std::process::Child> {
 }
 
 /// Unmounts the scratch layer on every exit path of `execute`.
-struct Mounted<'a>(&'a std::path::Path);
+struct Mounted(PathBuf);
 
-impl Drop for Mounted<'_> {
+impl Drop for Mounted {
     fn drop(&mut self) {
-        if let Err(e) = layer::unmount(self.0) {
+        if let Err(e) = layer::unmount(&self.0) {
             eprintln!("warning: unmount scratch layer: {e:#}");
         }
     }
 }
 
-/// Terminates the compute system on every exit path of `execute`, before
-/// the network and scratch layer it uses are released.
+/// Stops the compute system on every exit path of `execute`, before the
+/// network and scratch layer it uses are released. Shuts it down first, as
+/// Docker does: terminating a utility VM is pulling its power, and a scratch
+/// layer cut off mid-write may not boot again.
 struct Terminating(System);
 
 impl Drop for Terminating {
     fn drop(&mut self) {
-        let _ = self.0.terminate(); // fails harmlessly if already stopped
+        // Both fail harmlessly if it already stopped.
+        if self.0.shutdown(Duration::from_secs(30)).is_err() {
+            let _ = self.0.terminate();
+        }
     }
 }
 
 /// Supervise one run of the container until its process exits. The caller
 /// holds the supervisor lock ([`ContainerState::lock_supervisor`]).
 pub fn execute(state: &mut ContainerState, io: Io) -> Result<u32> {
-    if matches!(state.isolation, Isolation::Hyperv) {
-        bail!("hyper-v isolation is not implemented yet");
-    }
-    let scratch = state.scratch();
-    // Left mounted by a supervisor that was killed; we hold the lock, so no
-    // live run uses it.
-    let _ = layer::unmount(&scratch);
-    let volume = layer::mount(&scratch, &state.layers)?;
-    let _mounted = Mounted(&scratch);
-    let network = network::attach(state)?;
-
-    let config = ComputeSystem {
-        owner: "winner".into(),
-        schema_version: spec::SCHEMA_V2_1,
-        // The supervisor holds the only handle: if it dies, so does the container.
-        should_terminate_on_last_handle_closed: true,
-        container: Some(Container {
-            storage: Storage { layers: layer::chain(&state.layers)?, path: volume },
-            mapped_directories: state.mounts.clone(),
-            networking: network.as_ref().map(|n| Networking { namespace: n.namespace.clone() }),
-        }),
+    // Bindings drop last first: compute system, then network, then mount.
+    let (_mounted, _network, system) = match state.isolation {
+        Isolation::Process => {
+            let scratch = state.scratch();
+            // Left mounted by a supervisor that was killed; we hold the lock,
+            // so no live run uses it.
+            let _ = layer::unmount(&scratch);
+            let volume = layer::mount(&scratch, &state.layers)?;
+            let mounted = Mounted(scratch);
+            let network = network::attach(state)?;
+            let config = ComputeSystem {
+                owner: "winner".into(),
+                schema_version: spec::SCHEMA_V2_1,
+                // The supervisor holds the only handle: if it dies, so does the container.
+                should_terminate_on_last_handle_closed: true,
+                container: Some(Container {
+                    storage: Storage { layers: layer::chain(&state.layers)?, path: volume },
+                    mapped_directories: state.mounts.clone(),
+                    networking: network
+                        .as_ref()
+                        .and_then(|n| n.namespace.clone())
+                        .map(|namespace| Networking { namespace }),
+                }),
+            };
+            (Some(mounted), network, Terminating(System::create(&state.id, &config)?))
+        }
+        Isolation::Hyperv => {
+            // vmcompute attaches the scratch layer to the utility VM itself.
+            let network = network::attach(state)?;
+            let config = ContainerV1 {
+                system_type: "Container",
+                name: state.id.clone(),
+                owner: "winner".into(),
+                // Safe only while the scratch layer is still empty, as
+                // Docker does. Cuts about 0.2s off the first boot.
+                ignore_flushes_during_boot: !state.started,
+                layer_folder_path: state.scratch().to_string_lossy().into_owned(),
+                layers: layer::chain(&state.layers)?.into_iter().map(Into::into).collect(),
+                hv_partition: true,
+                hv_runtime: HvRuntime { image_path: utility_vm(&state.layers)?.to_string_lossy().into_owned() },
+                endpoint_list: network.as_ref().and_then(|n| n.endpoint.clone()).into_iter().collect(),
+                mapped_directories: state.mounts.clone(),
+                terminate_on_last_handle_closed: true,
+            };
+            (None, network, Terminating(System::create(&state.id, &config)?))
+        }
     };
-    let system = Terminating(System::create(&state.id, &config)?);
     let system = &system.0;
     let _interruptible = matches!(io, Io::Console { .. }).then(|| Interruptible::new(&state.id));
     system.start()?;
+    if !state.started {
+        state.started = true;
+        state.save()?;
+    }
 
     let (tty, stdin) = match io {
         Io::Console { tty } => (tty, true),
         Io::Log => (false, false),
     };
     let (process, pipes) = system.create_process(&process_parameters(&state.process, tty, stdin))?;
+    FOREGROUND_PID.store(pipes.pid, std::sync::atomic::Ordering::Relaxed);
     // Only now is it running: `start` treats this as success, so a process
     // that fails to launch must surface as an error instead.
     state.status = Status::Running;
+    state.pid = Some(pipes.pid);
     state.save()?;
 
     let code = match io {
@@ -275,6 +314,7 @@ pub fn execute(state: &mut ContainerState, io: Io) -> Result<u32> {
 
     state.status = Status::Exited;
     state.exit_code = Some(code);
+    state.pid = None;
     state.save()?;
     Ok(code)
 }
@@ -286,6 +326,8 @@ const STATUS_CONTROL_C_EXIT: u32 = 0xC000_013A;
 /// control handler, and whether that handler terminated it.
 static FOREGROUND: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Its main process, once started (0 before).
+static FOREGROUND_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// While alive, Ctrl+C / Ctrl+Break / closing the console terminate the
 /// foreground container instead of killing winner, so `execute` still
@@ -308,6 +350,7 @@ impl Drop for Interruptible {
         use windows::Win32::System::Console::SetConsoleCtrlHandler;
         let _ = unsafe { SetConsoleCtrlHandler(Some(on_console_ctrl), false) };
         *FOREGROUND.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        FOREGROUND_PID.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -316,9 +359,8 @@ unsafe extern "system" fn on_console_ctrl(event: u32) -> windows::core::BOOL {
     let id = FOREGROUND.lock().ok().and_then(|g| g.clone());
     let Some(id) = id else { return false.into() };
     INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
-    if let Ok(system) = System::open(&id) {
-        let _ = system.terminate();
-    }
+    let pid = FOREGROUND_PID.load(std::sync::atomic::Ordering::Relaxed);
+    let _ = crate::control::end(&id, (pid != 0).then_some(pid));
     if event == CTRL_CLOSE_EVENT {
         // Windows ends the process when the handler returns; give the main
         // thread a moment to clean up.
@@ -388,23 +430,40 @@ fn watch_console_size(
     })
 }
 
-fn resolve_isolation(image: &ImageRecord, requested: Option<Isolation>) -> Result<Isolation> {
+/// `layers` are the image's layer directories, base first.
+fn resolve_isolation(image: &ImageRecord, layers: &[PathBuf], requested: Option<Isolation>) -> Result<Isolation> {
     let host = host::build();
     let image_build = image.os_version.as_deref().and_then(host::build_of);
+    if let Some(b) = image_build
+        && b > host
+    {
+        bail!("image build {b} is newer than host build {host}: Windows cannot run it with any isolation");
+    }
     let isolation = requested.unwrap_or(match image_build {
         Some(b) if !host::process_compatible(host, b) => Isolation::Hyperv,
         _ => Isolation::Process,
     });
-    if matches!(isolation, Isolation::Hyperv) {
-        // TODO: utility VM (HostingSystemId + VirtualMachine schema).
-        match (requested, image_build) {
-            (None, Some(b)) => bail!(
-                "image build {b} cannot run with process isolation on host build {host}, and hyper-v isolation is not implemented yet"
-            ),
-            _ => bail!("hyper-v isolation is not implemented yet"),
+    match (isolation, image_build) {
+        (Isolation::Process, Some(b)) if !host::process_compatible(host, b) => {
+            bail!("image build {b} cannot run with process isolation on host build {host}; use --isolation hyperv")
         }
+        (Isolation::Hyperv, _) => {
+            utility_vm(layers)?;
+        }
+        _ => {}
     }
     Ok(isolation)
+}
+
+/// The `UtilityVM` directory of the topmost layer that has one: the image the
+/// hyper-v utility VM boots from. Only base layers carry it.
+fn utility_vm(layers: &[PathBuf]) -> Result<PathBuf> {
+    layers
+        .iter()
+        .rev()
+        .map(|l| l.join("UtilityVM"))
+        .find(|p| p.is_dir())
+        .context("the image has no utility VM image, so it cannot run with hyper-v isolation")
 }
 
 /// Resolve the process to run following the OCI rules: `entrypoint` replaces

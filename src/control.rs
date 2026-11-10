@@ -35,10 +35,24 @@ pub fn kill(query: &str) -> Result<()> {
     if !state.is_running() {
         bail!("container {} is not running", state.id);
     }
-    System::open(&state.id)?.terminate()?;
+    end(&state.id, state.pid)?;
     wait_exited(&state)?;
     println!("{}", state.id);
     Ok(())
+}
+
+/// Kill a container at once. Ends its main process when known and leaves the
+/// rest to the supervisor, which then shuts the compute system down cleanly:
+/// terminating a utility VM pulls its power, and one cut off during its first
+/// run leaves a scratch layer it never boots from again.
+pub fn end(id: &str, pid: Option<u32>) -> Result<()> {
+    let system = System::open(id)?;
+    if let Some(pid) = pid
+        && system.open_process(pid).and_then(|p| p.terminate()).is_ok()
+    {
+        return Ok(());
+    }
+    system.terminate()
 }
 
 /// The supervisor records the exit, then releases the network and scratch

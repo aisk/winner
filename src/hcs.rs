@@ -10,6 +10,10 @@ use windows::Win32::System::HostComputeSystem::*;
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 
 const INFINITE: u32 = u32::MAX;
+const GENERIC_ALL: u32 = 0x1000_0000;
+/// How long a compute system may take to start, as hcsshim allows. A utility
+/// VM that cannot boot otherwise leaves the start pending forever.
+const START_TIMEOUT_MS: u32 = 4 * 60 * 1000;
 
 /// Take ownership of an HCS-allocated result document.
 fn take_doc(p: PWSTR) -> Option<String> {
@@ -98,7 +102,6 @@ impl System {
     }
 
     pub fn open(id: &str) -> Result<Self> {
-        const GENERIC_ALL: u32 = 0x1000_0000;
         let handle = unsafe { HcsOpenComputeSystem(&HSTRING::from(id), GENERIC_ALL) }
             .with_context(|| format!("HcsOpenComputeSystem {id}"))?;
         Ok(Self(handle))
@@ -107,7 +110,7 @@ impl System {
     pub fn start(&self) -> Result<()> {
         let op = Operation::new();
         unsafe { HcsStartComputeSystem(self.0, op.0, None) }.context("HcsStartComputeSystem")?;
-        op.wait().context("start compute system")?;
+        op.wait_timeout(START_TIMEOUT_MS).context("start compute system")?;
         Ok(())
     }
 
@@ -125,6 +128,12 @@ impl System {
         unsafe { HcsTerminateComputeSystem(self.0, op.0, None) }.context("HcsTerminateComputeSystem")?;
         op.wait().context("terminate compute system")?;
         Ok(())
+    }
+
+    /// A process already running in this compute system.
+    pub fn open_process(&self, pid: u32) -> Result<Process> {
+        let handle = unsafe { HcsOpenProcess(self.0, pid, GENERIC_ALL) }.context("HcsOpenProcess")?;
+        Ok(Process(handle))
     }
 
     pub fn create_process(&self, params: &crate::spec::ProcessParameters) -> Result<(Process, Stdio)> {
@@ -154,7 +163,6 @@ impl Drop for System {
 }
 
 pub struct Stdio {
-    #[allow(dead_code)]
     pub pid: u32,
     pub stdin: Option<OwnedHandle>,
     pub stdout: Option<OwnedHandle>,
@@ -180,6 +188,13 @@ impl Process {
             .and_then(|v| v.get("ExitCode")?.as_u64())
             .ok_or_else(|| anyhow!("process exited without an exit code: {}", doc.as_deref().unwrap_or("")))?;
         Ok(code as u32)
+    }
+
+    pub fn terminate(&self) -> Result<()> {
+        let op = Operation::new();
+        unsafe { HcsTerminateProcess(self.0, op.0, None) }.context("HcsTerminateProcess")?;
+        op.wait().context("terminate process")?;
+        Ok(())
     }
 
     /// Signal EOF on the process's stdin. Closing our end of the pipe is not

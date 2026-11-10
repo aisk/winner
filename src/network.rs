@@ -14,7 +14,7 @@
 //! container asked for.
 
 use crate::hcn::{self, Kind};
-use crate::{Format, state, table};
+use crate::{Format, Isolation, state, table};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -98,7 +98,7 @@ pub fn parse_publish(spec: &str) -> Result<PortMapping> {
 
 /// Validate `--network` and `--publish` at create time. Returns the network
 /// to record: `None` for `--network none`.
-pub fn resolve(network: Option<&str>, ports: &[PortMapping]) -> Result<Option<String>> {
+pub fn resolve(network: Option<&str>, ports: &[PortMapping], isolation: Isolation) -> Result<Option<String>> {
     let network = match network {
         Some(NONE) => {
             if !ports.is_empty() {
@@ -107,6 +107,9 @@ pub fn resolve(network: Option<&str>, ports: &[PortMapping]) -> Result<Option<St
             return Ok(None);
         }
         Some(HOST) => {
+            if matches!(isolation, Isolation::Hyperv) {
+                bail!("--network host needs process isolation: a hyper-v container has its own kernel and network stack");
+            }
             if !ports.is_empty() {
                 bail!("--publish has no effect with --network host: the container uses the host's ports directly");
             }
@@ -225,7 +228,11 @@ pub fn delete(name: &str) -> Result<()> {
 pub struct Attachment {
     /// The container whose objects to release; `None` for the host namespace.
     container: Option<String>,
-    pub namespace: String,
+    /// For process isolation: the namespace (compartment) to place it in.
+    pub namespace: Option<String>,
+    /// For hyper-v isolation: the endpoint, which vmcompute adds to the
+    /// utility VM itself.
+    pub endpoint: Option<String>,
 }
 
 impl Drop for Attachment {
@@ -242,14 +249,19 @@ impl Drop for Attachment {
 pub fn attach(state: &state::ContainerState) -> Result<Option<Attachment>> {
     let Some(name) = &state.network else { return Ok(None) };
     if name == HOST {
-        return Ok(Some(Attachment { container: None, namespace: host_namespace()? }));
+        return Ok(Some(Attachment { container: None, namespace: Some(host_namespace()?), endpoint: None }));
     }
     sweep();
     // Left over from a run whose supervisor was killed.
     release(&state.id)?;
     let network = network_for(name)?;
-    let attachment =
-        Attachment { container: Some(state.id.clone()), namespace: hcn::guid_string(&namespace_id(&state.id)?) };
+    let endpoint = endpoint_id(&state.id)?;
+    let hyperv = matches!(state.isolation, Isolation::Hyperv);
+    let attachment = Attachment {
+        container: Some(state.id.clone()),
+        namespace: (!hyperv).then(|| namespace_id(&state.id).map(|n| hcn::guid_string(&n))).transpose()?,
+        endpoint: hyperv.then(|| hcn::guid_string(&endpoint)),
+    };
 
     let policies: Vec<_> = state
         .ports
@@ -261,7 +273,6 @@ pub fn attach(state: &state::ContainerState) -> Result<Option<Attachment>> {
             })
         })
         .collect();
-    let endpoint = endpoint_id(&state.id)?;
     let settings = json!({
         "Name": format!("{ENDPOINT_PREFIX}{}", state.id),
         "HostComputeNetwork": hcn::guid_string(&network),
@@ -270,6 +281,9 @@ pub fn attach(state: &state::ContainerState) -> Result<Option<Attachment>> {
     });
     // From here on, dropping `attachment` cleans up whatever was created.
     hcn::create_endpoint(&network, &endpoint, &settings).with_context(|| format!("connect to network {name}"))?;
+    if hyperv {
+        return Ok(Some(attachment));
+    }
     let namespace = namespace_id(&state.id)?;
     hcn::create_namespace(&namespace, &json!({ "SchemaVersion": schema() }))?;
     hcn::add_namespace_endpoint(&namespace, &endpoint)?;

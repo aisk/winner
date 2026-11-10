@@ -49,6 +49,14 @@ pub struct ContainerState {
     /// Delete the container once it exits.
     #[serde(default)]
     pub remove: bool,
+    /// Whether its compute system has ever started, so the scratch layer may
+    /// hold data that must survive the next boot.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub started: bool,
+    /// ID of the container's main process (inside the container) while it
+    /// runs, so `kill` can end it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]

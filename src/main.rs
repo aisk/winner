@@ -286,8 +286,6 @@ enum SystemCommand {
 #[serde(rename_all = "lowercase")]
 pub enum Isolation {
     Process,
-    // Hidden until utility VM support lands.
-    #[value(hide = true)]
     Hyperv,
 }
 

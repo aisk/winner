@@ -1,4 +1,5 @@
-//! HCS v2 JSON schema types (subset).
+//! HCS JSON schema types (subset): v2, plus the v1 container document used
+//! for Hyper-V isolation.
 //!
 //! Reference: https://learn.microsoft.com/virtualization/api/hcs/schemareference
 
@@ -29,7 +30,6 @@ pub struct ComputeSystem {
     pub should_terminate_on_last_handle_closed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container: Option<Container>,
-    // TODO: HostingSystemId / VirtualMachine for Hyper-V isolation.
 }
 
 #[derive(Serialize)]
@@ -84,4 +84,50 @@ pub struct ProcessParameters {
     pub create_std_in_pipe: bool,
     pub create_std_out_pipe: bool,
     pub create_std_err_pipe: bool,
+}
+
+/// HCS v1 document for a Hyper-V isolated container: vmcompute boots and
+/// manages the utility VM itself (as Docker does), instead of the v2 route
+/// where the caller runs the VM and talks to its guest compute service.
+///
+/// Reference: hcsshim `ContainerConfig` (internal/hcs/schema1).
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ContainerV1 {
+    pub system_type: &'static str,
+    pub name: String,
+    pub owner: String,
+    pub ignore_flushes_during_boot: bool,
+    /// Scratch layer directory (from CreateSandboxLayer); not mounted.
+    pub layer_folder_path: String,
+    /// Parent layers, topmost first.
+    pub layers: Vec<LayerV1>,
+    pub hv_partition: bool,
+    pub hv_runtime: HvRuntime,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub endpoint_list: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mapped_directories: Vec<MappedDirectory>,
+    pub terminate_on_last_handle_closed: bool,
+}
+
+#[derive(Serialize)]
+pub struct LayerV1 {
+    #[serde(rename = "ID")]
+    pub id: String,
+    #[serde(rename = "Path")]
+    pub path: String,
+}
+
+impl From<Layer> for LayerV1 {
+    fn from(l: Layer) -> Self {
+        Self { id: l.id, path: l.path }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct HvRuntime {
+    /// `UtilityVM` directory of the topmost layer that has one.
+    pub image_path: String,
 }
