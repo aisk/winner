@@ -287,14 +287,15 @@ Case 'orphan' {
 }
 
 Case 'interrupt' {
-    # The foreground run needs a console of its own, so a helper pwsh opens
-    # one, starts winner in it, and sends Ctrl+Break to that console while
-    # swallowing the event itself. (Sending from outside with AttachConsole
-    # never arrived.) Ctrl+Break because a process started this way may have
-    # Ctrl+C ignored; winner handles both the same way.
+    # A foreground run or exec needs a console of its own, so a helper pwsh
+    # opens one, starts winner in it, and sends Ctrl+Break to that console
+    # while swallowing the event itself. (Sending from outside with
+    # AttachConsole never arrived.) Ctrl+Break because a process started this
+    # way may have Ctrl+C ignored; winner handles both the same way.
+    # Mode `run` waits for container e2e-int to run first, `exec` a moment.
     $helper = Join-Path ([IO.Path]::GetTempPath()) "winner-e2e-int-$PID.ps1"
     Set-Content $helper @'
-param($Winner, $Nano)
+param($Winner, $Mode)
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
@@ -306,24 +307,45 @@ public static class Ctrl {
     public static void Swallow() { SetConsoleCtrlHandler(swallow, true); }
 }
 "@
-$w = Start-Process -FilePath $Winner -ArgumentList @('run', '--name', 'e2e-int', '--no-tty', $Nano, 'ping', '-n', '120', '127.0.0.1') -NoNewWindow -PassThru
-$deadline = (Get-Date).AddSeconds(60)
-while ((Get-Date) -lt $deadline) {
-    $s = & $Winner inspect e2e-int 2>$null | ConvertFrom-Json
-    if ($s -and $s[0].status -eq 'running') { break }
-    Start-Sleep -Milliseconds 500
+$w = Start-Process -FilePath $Winner -ArgumentList $args -NoNewWindow -PassThru
+if ($Mode -eq 'run') {
+    $deadline = (Get-Date).AddSeconds(60)
+    while ((Get-Date) -lt $deadline) {
+        $s = & $Winner inspect e2e-int 2>$null | ConvertFrom-Json
+        if ($s -and $s[0].status -eq 'running') { break }
+        Start-Sleep -Milliseconds 500
+    }
+} else {
+    Start-Sleep 5
 }
 [Ctrl]::Swallow()
 if (-not [Ctrl]::GenerateConsoleCtrlEvent(1, 0)) { exit 3 }
 if (-not $w.WaitForExit(30000)) { $w.Kill(); exit 4 }
 exit $w.ExitCode
 '@
+    $pwsh = (Get-Process -Id $PID).Path
+    function Interrupt([string]$Mode, [string[]]$A) {
+        Start-Process -FilePath $pwsh -ArgumentList (@('-NoProfile', '-File', $helper, $Winner, $Mode) + $A) -WindowStyle Minimized -PassThru -Wait
+    }
+    # Nano Server has no tasklist, but process-isolated container processes
+    # show up on the host; the exec'd one pings an address of its own.
+    function Pings([string]$Address) {
+        @(Get-CimInstance Win32_Process -Filter "Name = 'PING.EXE'" | Where-Object { $_.CommandLine -match [regex]::Escape($Address) }).Count
+    }
     try {
-        $h = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList @('-NoProfile', '-File', $helper, $Winner, $Nano) -WindowStyle Minimized -PassThru -Wait
+        $h = Interrupt 'run' @('run', '--name', 'e2e-int', '--no-tty', $Nano, 'ping', '-n', '120', '127.0.0.1')
         $s = State 'e2e-int'
-        Check 'winner exits with the Ctrl+C exit code (its handler ran)' ($h.ExitCode -eq -1073741510) ([pscustomobject]@{ Code = $h.ExitCode })
-        Check 'the exit is recorded' ($s -and $s.status -eq 'exited' -and $s.exit_code -eq 3221225786)
-        Check 'its endpoint is released' ($s -and -not ((Endpoints) -contains "winner-$($s.id)"))
+        Check 'run: winner exits with the Ctrl+C exit code (its handler ran)' ($h.ExitCode -eq -1073741510) ([pscustomobject]@{ Code = $h.ExitCode })
+        Check 'run: the exit is recorded' ($s -and $s.status -eq 'exited' -and $s.exit_code -eq 3221225786)
+        Check 'run: its endpoint is released' ($s -and -not ((Endpoints) -contains "winner-$($s.id)"))
+        W @('delete', '--force', 'e2e-int') | Out-Null
+
+        W @('run', '-d', '--name', 'e2e-int', $Nano, 'ping', '-n', '600', '127.0.0.2') | Out-Null
+        $h = Interrupt 'exec' @('exec', '--no-tty', 'e2e-int', 'ping', '-n', '120', '127.0.0.3')
+        Check 'exec: winner exits with the Ctrl+C exit code' ($h.ExitCode -eq -1073741510) ([pscustomobject]@{ Code = $h.ExitCode })
+        Check 'exec: the container keeps running' ((State 'e2e-int').status -eq 'running')
+        $main, $execd = (Pings '127.0.0.2'), (Pings '127.0.0.3')
+        Check "exec: the exec'd process is ended, the main one is not" ($main -eq 1 -and $execd -eq 0) ([pscustomobject]@{ Main = $main; Execd = $execd })
     } finally {
         Remove-Item -Force $helper
         W @('delete', '--force', 'e2e-int') | Out-Null
