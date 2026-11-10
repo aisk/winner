@@ -14,6 +14,7 @@ hcs.rs      synchronous wrappers over computecore.dll (HCS v2)
 hcn.rs      synchronous wrappers over computenetwork.dll (HCN, the HNS v2 API)
 network.rs  networks, per-container endpoints and namespaces, port mappings
 run.rs      create, run, start; `execute` supervises one run of a container
+            (v2 document for process isolation, v1 for Hyper-V)
 control.rs  stop, kill, exec, logs, inspect, delete (by container ID via vmcompute)
 shim.rs     detached supervisor: `execute` with output to the container log
 stdio.rs    one blocking thread per stream; raw VT console for ttys
@@ -128,7 +129,7 @@ legacy **vmcompute v1** layer APIs, not computestorage:
 | Mount scratch | `ActivateLayer` -> `PrepareLayer` -> `GetLayerMountPath` |
 | Unmount | `UnprepareLayer` -> `DeactivateLayer` |
 | Delete a layer dir | `computestorage!HcsDestroyLayer` |
-| Container / process | `computecore` (HCS v2 JSON) |
+| Container / process | `computecore` (HCS v2 JSON; v1 JSON for Hyper-V, see below) |
 
 `HcsInitializeWritableLayer` / `HcsAttachLayerStorageFilter` target
 VHD/CimFS layers and fail with `ERROR_PATH_NOT_FOUND` for this use.
@@ -176,6 +177,71 @@ hard links are created (target in this layer if it was added here, otherwise
 the topmost parent that has it), and directory times are re-applied because
 both steps bump them. UtilityVM content in non-base layers is not supported
 yet (only needed for Hyper-V isolation).
+
+## Hyper-V isolation
+
+A Hyper-V isolated container runs in a utility VM booted from the base
+layer's `UtilityVM/` directory (prepared at import by `ProcessUtilityImage`:
+`SystemTemplate.vhdx` and friends). There are two ways to drive one:
+
+- **HCS v2** (what hcsshim and containerd do today): the caller creates the
+  utility VM as its own compute system, adds the layers and scratch to it
+  over SCSI / VSMB, and creates the container inside it by talking to the
+  guest compute service (GCS) over a hvsocket bridge with its own protocol.
+  That is most of hcsshim's `internal/uvm` and `internal/gcs`.
+- **HCS v1** (what Docker's `libcontainerd/local` still does): one
+  `ContainerConfig` document with `HvPartition: true`, and vmcompute boots
+  and manages the VM itself. Same `HcsCreateComputeSystem` /
+  `HcsCreateProcess` calls as process isolation, just a different document.
+
+winner uses v1 (`spec::ContainerV1`). The document differs from the process
+isolated one in a few places:
+
+- `LayerFolderPath` is the scratch directory from `CreateSandboxLayer`. It is
+  **not** mounted on the host; vmcompute attaches `sandbox.vhdx` to the VM.
+- `Layers` is the same list as `Storage.Layers` (topmost first, ID =
+  `NameToGuid(dir name)`), but with the keys spelled `ID` / `Path`.
+- `HvRuntime.ImagePath` is the `UtilityVM` directory of the topmost layer
+  that has one (only base layers do).
+- Networking is `EndpointList: [endpoint id]` instead of a namespace: the
+  endpoint is created the same way (derived ID, port mappings), vmcompute
+  adds it to the VM as a NIC. No namespace is created; `release` deleting a
+  missing namespace is a no-op. `--network host` is refused, since the VM
+  has its own network stack.
+- `TerminateOnLastHandleClosed` is the v1 name of
+  `ShouldTerminateOnLastHandleClosed`.
+
+Processes use the same `HcsCreateProcess` document (v1 and v2 share the
+field names), and `ConsoleSize` modification, shutdown and terminate work
+the same way, so `exec`, `stop`, `kill` and console resize need no changes.
+
+**Never pull the power on a utility VM during its first run.** Terminating
+the compute system (`HcsTerminateComputeSystem`) at any point of the first
+run of a fresh scratch layer leaves one the VM never boots from again: the
+next start fails with `0x80370111` (communication protocol error) when
+`IgnoreFlushesDuringBoot` is set, and with flushes on it hangs in
+`HcsStartComputeSystem` forever. Later runs survive it, but there is no
+reason to rely on that. So:
+
+- After the main process exits, the supervisor shuts the compute system down
+  (`HcsShutDownComputeSystem`, 30s) and terminates only if that fails, as
+  Docker does. Terminating right away also raced `stop`: the shutdown it
+  requested was cut off by the supervisor's terminate.
+- `kill` and Ctrl+C end the main process (`HcsTerminateProcess`, by the PID
+  the supervisor records in state.json) instead of the compute system; the
+  supervisor then shuts it down. Terminating the system stays the fallback.
+- `IgnoreFlushesDuringBoot` is set only on the first start (`started` in
+  state.json), as Docker does; it saves about 0.2s of a 1.5s start.
+- `HcsStartComputeSystem` is waited on for at most 4 minutes (hcsshim's
+  limit) so a VM that cannot boot fails the start instead of hanging it.
+
+A supervisor killed during the first run still loses the container (the
+last handle closes and vmcompute terminates the system).
+
+Isolation is picked at `create`: process isolation when the host can run the
+image build (`host::process_compatible`), else Hyper-V. An image newer than
+the host cannot run at all, and asking for process isolation of an
+incompatible image fails early instead of at start.
 
 ## Networking
 
@@ -287,7 +353,8 @@ Details that matter:
 - **Ctrl+C in the foreground**: by default it kills winner, and with it the
   container (last handle closed), but skips recording the exit, releasing
   the network and scratch layer, and `--remove`. `run` installs a console
-  control handler that terminates the container instead and lets `execute`
+  control handler that ends the container's main process instead (see Hyper-V
+  isolation for why not the whole container) and lets `execute`
   finish; the exit code is `0xC000013A` as for any Ctrl+C'd program (HCS
   itself reports `0xC0000001` for a process of a terminated container). With
   a tty, Ctrl+C is input for the container and only Ctrl+Break reaches the

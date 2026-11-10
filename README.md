@@ -27,7 +27,9 @@ no background service of its own: a single executable that talks to
   processing writes directly to mounted VHDs and is otherwise blocked
   (surfacing as `Access is denied`).
 - Process isolation requires the image build to be compatible with the host
-  (for example `ltsc2025` / 26100 on Windows 11 24H2+).
+  (for example `ltsc2025` / 26100 on Windows 11 24H2+). Other images run with
+  Hyper-V isolation, which needs the **Hyper-V** feature as well
+  (`Microsoft-Hyper-V`) and an image no newer than the host.
 
 ## Usage
 
@@ -78,7 +80,9 @@ as aliases for `list` and `delete`. A tty is detected automatically;
   `ContainerUser` cannot read a directory only your account may access; grant
   access or run with `-u ContainerAdministrator`.
 - Isolation is picked automatically: process isolation when the image build
-  is compatible with the host.
+  is compatible with the host, Hyper-V otherwise. `--isolation hyperv` forces
+  a utility VM (slower to start, own kernel); it does not support
+  `--network host`.
 - `run` pulls a missing image itself (`--pull missing|always|never`).
 - Image references must name the registry; there is no implicit Docker Hub.
   Once pulled, a short form such as `nanoserver:ltsc2025` finds the local image.
@@ -131,6 +135,6 @@ Results are also written to `target\e2e.log`.
 - [x] Detached containers, logs, exec, stop / kill
 - [x] Networking (HCN): NAT, published ports, host and none modes
 - [x] Console resize forwarding, `system prune`
-- [ ] Hyper-V isolation
+- [x] Hyper-V isolation (HCS v1, utility VM managed by vmcompute)
 
 See [docs/development.md](docs/development.md) for design notes.
