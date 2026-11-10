@@ -11,9 +11,11 @@ use windows::core::{HSTRING, PCWSTR, PWSTR};
 
 const INFINITE: u32 = u32::MAX;
 const GENERIC_ALL: u32 = 0x1000_0000;
-/// How long a compute system may take to start, as hcsshim allows. A utility
-/// VM that cannot boot otherwise leaves the start pending forever.
-const START_TIMEOUT_MS: u32 = 4 * 60 * 1000;
+/// How long any HCS operation may take, as hcsshim allows (its default for
+/// create, start, ...). Without a limit a stuck vmcompute, or a utility VM
+/// that cannot boot, leaves the caller blocked forever. Waiting for a
+/// process to exit is the one unbounded wait.
+const OPERATION_TIMEOUT_MS: u32 = 4 * 60 * 1000;
 
 /// Take ownership of an HCS-allocated result document.
 fn take_doc(p: PWSTR) -> Option<String> {
@@ -42,7 +44,7 @@ impl Operation {
     }
 
     fn wait(&self) -> Result<Option<String>> {
-        self.wait_timeout(INFINITE)
+        self.wait_timeout(OPERATION_TIMEOUT_MS)
     }
 
     fn wait_timeout(&self, millis: u32) -> Result<Option<String>> {
@@ -56,7 +58,7 @@ impl Operation {
         let mut info = HCS_PROCESS_INFORMATION::default();
         let mut doc = PWSTR::null();
         let r = unsafe {
-            HcsWaitForOperationResultAndProcessInfo(self.0, INFINITE, Some(&mut info), Some(&mut doc))
+            HcsWaitForOperationResultAndProcessInfo(self.0, OPERATION_TIMEOUT_MS, Some(&mut info), Some(&mut doc))
         };
         let doc = take_doc(doc);
         r.map(|()| info).map_err(|e| with_doc(e, doc))
@@ -110,7 +112,7 @@ impl System {
     pub fn start(&self) -> Result<()> {
         let op = Operation::new();
         unsafe { HcsStartComputeSystem(self.0, op.0, None) }.context("HcsStartComputeSystem")?;
-        op.wait_timeout(START_TIMEOUT_MS).context("start compute system")?;
+        op.wait().context("start compute system")?;
         Ok(())
     }
 
