@@ -3,7 +3,8 @@
 //! they go through vmcompute by container ID.
 
 use crate::hcs::System;
-use crate::run::{self, quote_arg};
+use crate::process::{self, quote_arg};
+use crate::run;
 use crate::state::{self, ContainerState, ProcessConfig};
 use anyhow::{Context, Result, bail};
 use std::io::{Read, Write};
@@ -85,12 +86,12 @@ pub fn exec(query: &str, args: &[String], opts: ExecOptions) -> Result<u32> {
     let system = System::open(&state.id)?;
     let process = ProcessConfig {
         command_line: args.iter().map(|a| quote_arg(a)).collect::<Vec<_>>().join(" "),
-        environment: run::merge_env(state.process.environment.clone(), &opts.env)?,
+        environment: process::merge_env(state.process.environment.clone(), &opts.env)?,
         working_directory: opts.workdir.or_else(|| state.process.working_directory.clone()),
         user: opts.user.or_else(|| state.process.user.clone()),
     };
     let tty = opts.tty.unwrap_or_else(crate::stdio::detect_tty);
-    run::attach(&system, &process, tty)
+    process::attach(&system, &process, tty)
 }
 
 pub fn remove(query: &str, force: bool) -> Result<()> {

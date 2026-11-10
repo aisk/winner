@@ -13,8 +13,10 @@ backup.rs   Win32 backup stream encoding, privileges, FILETIME helpers
 hcs.rs      synchronous wrappers over computecore.dll (HCS v2)
 hcn.rs      synchronous wrappers over computenetwork.dll (HCN, the HNS v2 API)
 network.rs  networks, per-container endpoints and namespaces, port mappings
-run.rs      create, run, start; `execute` supervises one run of a container
-            (v2 document for process isolation, v1 for Hyper-V)
+run.rs      create, run, start: resolving image, isolation, command, volumes
+supervisor.rs  `execute` supervises one run of a container (v2 document for
+            process isolation, v1 for Hyper-V); Ctrl+C handling
+process.rs  process parameters, console forwarding (run and exec), env, quoting
 control.rs  stop, kill, exec, logs, inspect, delete (by container ID via vmcompute)
 shim.rs     detached supervisor: `execute` with output to the container log
 stdio.rs    one blocking thread per stream; raw VT console for ttys
@@ -259,7 +261,7 @@ schema v2): create the endpoint on the network, create the namespace, add the
 endpoint (`HcnModifyNamespace` with
 `{"ResourceType":"Endpoint","RequestType":"Add","Settings":{"EndpointId":"..."}}`),
 then create the compute system. Everything is released after the compute
-system is terminated (`Terminating` guard in `run::execute`).
+system is terminated (`Terminating` guard in `supervisor::execute`).
 
 `--network host` uses the host's default namespace (`"Type": "HostDefault"`,
 `NamespaceId` 1 in an HCN query; `IsDefault: true` in `hnsdiag -d`) instead: the container sees the host's

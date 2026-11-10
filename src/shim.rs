@@ -8,7 +8,8 @@
 //! `inspect` can report why). It holds the only handle to the compute system, so killing the
 //! shim takes the container down too, and `list` notices.
 
-use crate::run::{self, Io};
+use crate::run;
+use crate::supervisor::{self, Io};
 use crate::state::{ContainerState, Status};
 use anyhow::Result;
 use std::io::Write;
@@ -19,7 +20,7 @@ pub fn main(id: &str) -> Result<()> {
     // recorded the exit. If the lock stays taken, another supervisor runs
     // this container: fail without touching its state.
     let lock = state.lock_supervisor(std::time::Duration::from_secs(10))?;
-    let result = run::execute(&mut state, Io::Log);
+    let result = supervisor::execute(&mut state, Io::Log);
     if let Err(e) = &result {
         let message = format!("{e:#}");
         if let Ok(mut log) = std::fs::OpenOptions::new().create(true).append(true).open(state.log()) {

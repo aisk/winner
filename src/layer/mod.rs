@@ -68,6 +68,17 @@ pub fn name_to_guid(name: &HSTRING) -> Result<GUID> {
     Ok(id)
 }
 
+/// The `UtilityVM` directory of the topmost layer that has one: the image the
+/// hyper-v utility VM boots from. Only base layers carry it.
+pub fn utility_vm(layers: &[PathBuf]) -> Result<PathBuf> {
+    layers
+        .iter()
+        .rev()
+        .map(|l| l.join("UtilityVM"))
+        .find(|p| p.is_dir())
+        .context("the image has no utility VM image, so it cannot run with hyper-v isolation")
+}
+
 /// Build the HCS layer list (topmost first) from directories given base first.
 pub fn chain(base_first: &[PathBuf]) -> Result<Vec<spec::Layer>> {
     base_first

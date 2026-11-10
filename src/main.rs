@@ -10,12 +10,14 @@ mod layer;
 mod lock;
 mod network;
 mod paths;
+mod process;
 mod pull;
 mod run;
 mod shim;
 mod spec;
 mod state;
 mod stdio;
+mod supervisor;
 mod system;
 mod table;
 
