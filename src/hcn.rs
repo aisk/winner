@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use std::ffi::c_void;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::HostComputeNetwork::*;
-use windows::core::{GUID, HRESULT, HSTRING, PWSTR};
+use windows::core::{GUID, HSTRING, PWSTR};
 
 #[derive(Clone, Copy)]
 pub enum Kind {
@@ -71,10 +71,6 @@ fn check(r: windows::core::Result<()>, record: PWSTR, what: impl FnOnce() -> Str
     })
 }
 
-pub fn hresult(e: &anyhow::Error) -> Option<HRESULT> {
-    e.downcast_ref::<windows::core::Error>().map(|e| e.code())
-}
-
 fn query(filter: Option<&Value>) -> HSTRING {
     let mut q = json!({ "SchemaVersion": { "Major": 2, "Minor": 0 } });
     if let Some(f) = filter {
@@ -134,6 +130,17 @@ impl Drop for Handle {
 /// property values, e.g. `{"Name": "nat"}`). Objects deleted while listing
 /// are skipped.
 pub fn list(kind: Kind, filter: Option<&Value>) -> Result<Vec<Value>> {
+    let mut objects = Vec::new();
+    for id in ids(kind, filter)? {
+        if let Some(v) = get(kind, &id)? {
+            objects.push(v);
+        }
+    }
+    Ok(objects)
+}
+
+/// IDs of the objects of `kind` matching `filter`.
+fn ids(kind: Kind, filter: Option<&Value>) -> Result<Vec<GUID>> {
     let q = query(filter);
     let mut out = PWSTR::null();
     let mut rec = PWSTR::null();
@@ -150,22 +157,20 @@ pub fn list(kind: Kind, filter: Option<&Value>) -> Result<Vec<Value>> {
         Some(s) => serde_json::from_str::<Option<Vec<String>>>(&s)?.unwrap_or_default(),
         None => Vec::new(),
     };
-    let mut objects = Vec::new();
-    for id in ids {
-        if let Some(v) = get(kind, &parse_guid(&id)?)? {
-            objects.push(v);
-        }
-    }
-    Ok(objects)
+    ids.iter().map(|id| parse_guid(id)).collect()
 }
 
 /// Properties of one object, or `None` if it does not exist.
+///
+/// HCN has no one "not found" error (each kind has its own code, some none),
+/// so a failure counts as "not found" only if enumeration no longer lists
+/// the object; any other failure is an error. The enumeration compares
+/// parsed GUIDs, since HNS is not consistent about their case.
 pub fn get(kind: Kind, id: &GUID) -> Result<Option<Value>> {
-    const E_ACCESSDENIED: HRESULT = HRESULT(0x8007_0005_u32 as i32);
-    match Handle::open(kind, id) {
-        Ok(h) => h.properties().map(Some),
-        Err(e) if hresult(&e) == Some(E_ACCESSDENIED) => Err(e),
-        Err(_) => Ok(None),
+    match Handle::open(kind, id).and_then(|h| h.properties()) {
+        Ok(v) => Ok(Some(v)),
+        Err(_) if !ids(kind, None)?.contains(id) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
