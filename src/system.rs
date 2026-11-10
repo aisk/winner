@@ -1,6 +1,6 @@
 //! `system prune`: delete everything nothing needs anymore.
 
-use crate::{image, network, paths, run, state};
+use crate::{image, network, paths, run, state, store};
 use anyhow::{Result, bail};
 use std::collections::HashSet;
 use std::io::IsTerminal;
@@ -54,7 +54,7 @@ pub fn prune(all: bool, force: bool) -> Result<()> {
             }
         }
     }
-    image::collect_garbage();
+    store::collect_garbage();
 
     let after = disk_usage(&paths::root());
     println!("reclaimed {}", human(before.saturating_sub(after)));

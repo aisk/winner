@@ -144,7 +144,7 @@ fn import_base(blob: &Path, layer_dir: &Path) -> Result<()> {
 
 /// Non-base layer: stage, `ImportLayer`, then fix up (hcsshim legacyLayerWriterWrapper).
 fn import_layer(blob: &Path, layer_dir: &Path, parents: &[PathBuf]) -> Result<()> {
-    let staging = crate::paths::root().join("tmp").join(format!("import-{:032x}", GUID::new()?.to_u128()));
+    let staging = crate::paths::tmp().join(format!("import-{:032x}", GUID::new()?.to_u128()));
     std::fs::create_dir_all(&staging)?;
     let result = (|| {
         let mut sink = legacy::LegacySink::new(&staging, parents)?;

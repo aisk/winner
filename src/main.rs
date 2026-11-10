@@ -18,6 +18,7 @@ mod shim;
 mod spec;
 mod state;
 mod stdio;
+mod store;
 mod supervisor;
 mod system;
 
@@ -333,7 +334,7 @@ fn dispatch(command: Command) -> Result<i32> {
             ImageCommand::Inspect { images } => image::inspect(&images),
             ImageCommand::Delete { force, images } => {
                 let deleted = each(&images, |i| image::delete(i, force));
-                image::collect_garbage();
+                store::collect_garbage();
                 deleted
             }
         }),

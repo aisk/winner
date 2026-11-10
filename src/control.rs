@@ -104,7 +104,7 @@ pub fn remove(query: &str, force: bool) -> Result<()> {
     // Layers kept alive only by this container (its image was deleted with
     // --force) are garbage now.
     if crate::image::find(&state.image).ok().flatten().is_none() {
-        crate::image::collect_garbage();
+        crate::store::collect_garbage();
     }
     Ok(())
 }

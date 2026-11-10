@@ -1,10 +1,8 @@
 //! Local image records.
 
 use crate::output::{self, Format};
-use crate::{lock, paths};
+use crate::paths;
 use anyhow::{Context, Result, bail};
-use std::collections::HashSet;
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -99,7 +97,7 @@ pub fn normalize(reference: &str) -> Result<String> {
 
 /// Every image record, plus a description of each record file that cannot
 /// be read.
-fn load_all() -> (Vec<ImageRecord>, Vec<String>) {
+pub fn load_all() -> (Vec<ImageRecord>, Vec<String>) {
     let (mut records, mut unreadable) = (Vec::new(), Vec::new());
     for entry in std::fs::read_dir(paths::images()).into_iter().flatten().flatten() {
         let path = entry.path();
@@ -159,109 +157,6 @@ pub fn delete(reference: &str, force: bool) -> Result<()> {
     std::fs::remove_file(paths::image(&image.reference))?;
     println!("{}", image.reference);
     Ok(())
-}
-
-/// Coordinates pulls with garbage collection: a layer is imported before the
-/// image record that references it is written, so collecting while a pull
-/// runs would delete its fresh layers. Pulls hold the lock shared (several
-/// may run at once), collection holds it exclusively.
-pub struct StoreLock(#[allow(dead_code)] std::fs::File);
-
-impl StoreLock {
-    fn path() -> std::io::Result<PathBuf> {
-        std::fs::create_dir_all(paths::root())?;
-        Ok(paths::root().join("store.lock"))
-    }
-
-    /// Shared, for a pull. Waits while garbage collection runs.
-    pub fn shared() -> Result<Self> {
-        let share = lock::FILE_SHARE_READ | lock::FILE_SHARE_WRITE;
-        Self::path()
-            .and_then(|p| lock::wait(&p, share, std::time::Duration::from_secs(300)))
-            .map(Self)
-            .context("lock the image store")
-    }
-
-    /// Exclusive, for garbage collection.
-    fn exclusive() -> std::io::Result<Self> {
-        lock::open(&Self::path()?, lock::FILE_SHARE_NONE).map(Self)
-    }
-}
-
-/// Destroy imported layers, and their downloaded blobs, that no image record
-/// or container references anymore, and leftovers of interrupted imports.
-/// Failures are reported and skipped. Skipped entirely while a pull runs, or
-/// if any record cannot be read (its layers would look unused).
-pub fn collect_garbage() {
-    let _lock = match StoreLock::exclusive() {
-        Ok(l) => l,
-        Err(e) if lock::is_held(&e) => {
-            eprintln!("note: an image pull is running; unused layers are kept for now");
-            return;
-        }
-        Err(e) => {
-            eprintln!("warning: lock the image store: {e}; unused layers are kept");
-            return;
-        }
-    };
-    let (records, unreadable) = load_all();
-    let containers = match crate::state::all_checked() {
-        Ok(c) if unreadable.is_empty() => c,
-        Ok(_) => {
-            eprintln!("warning: unreadable image record {}; unused layers are kept", unreadable.join("; "));
-            return;
-        }
-        Err(e) => {
-            eprintln!("warning: {e:#}; unused layers are kept");
-            return;
-        }
-    };
-
-    // Leftovers of interrupted imports (none runs now): staging directories,
-    // and layers whose import marker is still there.
-    for entry in std::fs::read_dir(paths::tmp()).into_iter().flatten().flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let result = match name.strip_prefix("importing-") {
-            Some(layer) => {
-                let dir = paths::root().join("layers").join(layer);
-                let destroyed = if dir.exists() { crate::layer::destroy(&dir) } else { Ok(()) };
-                destroyed.and_then(|()| Ok(std::fs::remove_file(entry.path())?))
-            }
-            None => std::fs::remove_dir_all(entry.path()).map_err(Into::into),
-        };
-        if let Err(e) = result {
-            eprintln!("warning: delete {}: {e:#}", entry.path().display());
-        }
-    }
-
-    let mut keep: HashSet<PathBuf> = records.iter().flat_map(|r| r.layers.iter().map(|d| paths::layer(d))).collect();
-    keep.extend(containers.into_iter().flat_map(|c| c.layers));
-
-    let layers = paths::root().join("layers");
-    for entry in std::fs::read_dir(&layers).into_iter().flatten().flatten() {
-        let dir = entry.path();
-        if keep.contains(&dir) {
-            continue;
-        }
-        eprintln!("deleting layer {}", entry.file_name().to_string_lossy());
-        if let Err(e) = crate::layer::destroy(&dir) {
-            eprintln!("warning: delete layer {}: {e:#}", dir.display());
-        }
-    }
-
-    // A blob is only needed to (re)import its layer: blobs/<algo>/<hex> pairs
-    // with layers/<algo>-<hex>. Leftover `.partial` downloads go too.
-    for algo in std::fs::read_dir(paths::root().join("blobs")).into_iter().flatten().flatten() {
-        for blob in std::fs::read_dir(algo.path()).into_iter().flatten().flatten() {
-            let name = blob.file_name().to_string_lossy().into_owned();
-            let layer = layers.join(format!("{}-{name}", algo.file_name().to_string_lossy()));
-            if (name.contains(".partial") || !keep.contains(&layer))
-                && let Err(e) = std::fs::remove_file(blob.path())
-            {
-                eprintln!("warning: delete blob {name}: {e}");
-            }
-        }
-    }
 }
 
 pub fn inspect(references: &[String]) -> Result<()> {

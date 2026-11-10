@@ -6,8 +6,11 @@
 main.rs     CLI (clap): command definitions and dispatch only; value types
             the commands take live with the code that uses them
 output.rs   `--format`, human-readable tables
-pull.rs     registry pull; the only place tokio is used (current_thread + block_on)
-image.rs    local image records, reference matching, layer garbage collection
+pull.rs     registry pull (download only); the only place tokio is used
+            (current_thread + block_on)
+image.rs    local image records, reference matching
+store.rs    layer store: store lock, layer import bookkeeping (import lock,
+            markers), garbage collection of layers and blobs
 layer/      layer import and scratch layer mount
   import.rs   tar -> backup streams (go-winio backuptar), base layer writer
   legacy.rs   non-base layers: hcsshim legacyLayerWriter + vmcompute ImportLayer
@@ -96,7 +99,7 @@ again by name, a namespace has no name.
 Layers have the same problem in another shape: a pull imports layers before
 it writes the image record that references them, so garbage collection
 running meanwhile would see them as unused. `store.lock` is a reader-writer
-lock built from share modes: pulls open it sharing read and write (several
+lock (`store::Lock`) built from share modes: pulls open it sharing read and write (several
 pulls coexist), garbage collection opens it sharing nothing. Collection
 skips its turn while a pull runs; a pull waits while collection runs. With
 the exclusive lock held, `tmp/import-*` directories are leftovers of
