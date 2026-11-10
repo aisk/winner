@@ -4,7 +4,8 @@
 #   sudo pwsh -NoProfile -File scripts/e2e.ps1 [-Full] [-Only <pattern>]
 #
 # -Full also runs the image deletion tests, which delete the .NET test image
-# (about 225 MB to download again next time).
+# (about 225 MB to download again next time), and pulls an LTSC 2022 image
+# to check that an image the host cannot run process-isolated gets hyper-v.
 # Results are printed and written to target\e2e.log.
 
 param(
@@ -447,7 +448,73 @@ Case 'prune' {
     W @('delete', '--force', 'e2e-alive') | Out-Null
 }
 
+# --- hyper-v isolation -----------------------------------------------------
+
+Case 'hyperv' {
+    $hv = @('--isolation', 'hyperv')
+    $r = W (@('run', '--remove') + $hv + @($Nano, 'cmd', '/c', 'ver')) -Timeout 300
+    $build = ((W @('image', 'inspect', $Nano)).Out | ConvertFrom-Json)[0].os_version -replace '^(\d+\.\d+\.\d+).*', '$1'
+    Check 'runs in a utility VM with the image kernel' ($r.Code -eq 0 -and $r.Out -match [regex]::Escape($build)) $r
+    $r = W (@('run', '--name', 'e2e-hv') + $hv + @($Nano, 'cmd', '/c', 'exit 7')) -Timeout 300
+    $s = State 'e2e-hv'
+    Check 'passes the exit code through and records hyperv' ($r.Code -eq 7 -and $s.isolation -eq 'hyperv' -and $s.exit_code -eq 7) $r
+    W @('delete', 'e2e-hv') | Out-Null
+
+    $dir = Join-Path ([IO.Path]::GetTempPath()) "winner-e2e-hv-$PID"
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    Set-Content (Join-Path $dir 'hello.txt') 'from-host'
+    try {
+        $r = W (@('run', '--remove', '-u', 'ContainerAdministrator', '-v', "${dir}:C:\data") + $hv + @($Nano, 'cmd', '/c', 'type C:\data\hello.txt & echo from-vm> C:\data\rw.txt')) -Timeout 300
+        Check 'mapped directory in and out of the VM' ($r.Code -eq 0 -and $r.Out -match 'from-host' -and (Test-Path (Join-Path $dir 'rw.txt'))) $r
+    } finally {
+        Remove-Item -Recurse -Force $dir
+    }
+
+    $r = W (@('run', '--remove') + $hv + @($Nano, 'curl.exe', '-sS', '-o', 'NUL', '-w', '%{http_code}', 'https://mcr.microsoft.com/v2/')) -Timeout 300
+    Check 'network: DNS and outbound HTTPS' ($r.Code -eq 0 -and $r.Out -match '^(200|401)$') $r
+    $r = W (@('create', '--network', 'host') + $hv + @($Nano))
+    Check '--network host is refused' ($r.Code -ne 0 -and $r.Err -match 'process isolation') $r
+
+    # Terminating a utility VM during its first run used to leave a scratch
+    # layer that never boots again; kill now ends the process instead.
+    W (@('run', '-d', '--name', 'e2e-hv-kill') + $hv + @($Nano, 'ping', '-n', '600', '127.0.0.1')) -Timeout 300 | Out-Null
+    W @('exec', '-u', 'ContainerAdministrator', 'e2e-hv-kill', 'cmd', '/c', 'echo kept> C:\kept.txt') | Out-Null
+    $r = W @('kill', 'e2e-hv-kill') -Timeout 120
+    Check 'kill during the first run' ($r.Code -eq 0 -and (State 'e2e-hv-kill').status -eq 'exited') $r
+    $r = W @('start', 'e2e-hv-kill') -Timeout 300
+    $kept = W @('exec', 'e2e-hv-kill', 'cmd', '/c', 'type C:\kept.txt')
+    Check 'it starts again with its data' ($r.Code -eq 0 -and $kept.Out -match 'kept') $kept
+    W @('delete', '--force', 'e2e-hv-kill') -Timeout 120 | Out-Null
+
+    $r = W (@('run', '-d', '--name', 'e2e-hv-web', '-p', '18081:8080') + $hv + @($Web)) -Timeout 300
+    Check 'run -d --publish' ($r.Code -eq 0) $r
+    Check 'published port reachable on localhost' (WaitUntil { (HttpStatus 'http://localhost:18081/') -eq 200 } 120)
+    $r = W @('exec', 'e2e-hv-web', 'cmd', '/c', 'echo exec-ok')
+    Check 'exec runs in it' ($r.Code -eq 0 -and $r.Out -match 'exec-ok') $r
+    $r = W @('stop', '--timeout', '10', 'e2e-hv-web') -Timeout 120
+    Check 'stop' ($r.Code -eq 0 -and (State 'e2e-hv-web').status -eq 'exited') $r
+    Check 'its endpoint is released' (-not ((Endpoints) -contains "winner-$((State 'e2e-hv-web').id)"))
+    $r = W @('start', 'e2e-hv-web') -Timeout 300
+    Check 'start it again' ($r.Code -eq 0 -and (WaitUntil { (HttpStatus 'http://localhost:18081/') -eq 200 } 120)) $r
+    $id = (State 'e2e-hv-web').id
+    $r = W @('delete', '--force', 'e2e-hv-web') -Timeout 120
+    Check 'delete --force' ($r.Code -eq 0) $r
+    Check 'no endpoint is left' ((Endpoints).Count -eq 0)
+    Check 'no compute system is left' (-not (hcsdiag list 2>$null | Select-String -SimpleMatch $id))
+}
+
 if ($Full) {
+    Case 'hyperv-auto' {
+        $old = 'mcr.microsoft.com/windows/nanoserver:ltsc2022'
+        $had = ((W @('image', 'list', '--format', 'json')).Out | ConvertFrom-Json).reference -contains $old
+        $r = W @('run', '--remove', '--isolation', 'process', $old, 'cmd', '/c', 'ver') -Timeout 1800
+        Check 'process isolation of an older LTSC image is refused' ($r.Code -eq 125 -and $r.Err -match 'hyperv') $r
+        $r = W @('run', '--name', 'e2e-hv-auto', $old, 'cmd', '/c', 'ver') -Timeout 300
+        Check 'it runs with hyper-v picked automatically' ($r.Code -eq 0 -and $r.Out -match '10\.0\.20348' -and (State 'e2e-hv-auto').isolation -eq 'hyperv') $r
+        W @('delete', 'e2e-hv-auto') | Out-Null
+        if (-not $had) { W @('image', 'delete', $old) | Out-Null }
+    }
+
     Case 'image-delete' {
         W @('create', '--name', 'e2e-keep', $Dotnet, 'cmd', '/c', 'dotnet --list-runtimes') | Out-Null
         $r = W @('image', 'delete', $Dotnet)
