@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -79,38 +80,23 @@ impl ContainerState {
         matches!(self.status, Status::Running)
     }
 
+    /// Write the state. Only `run::create` makes the directory: a container
+    /// deleted meanwhile (`delete --force` racing its supervisor or `start`)
+    /// must not come back without a scratch layer.
     pub fn save(&self) -> Result<()> {
-        if matches!(self.status, Status::Created) {
-            std::fs::create_dir_all(self.dir())?;
-        } else if !self.dir().exists() {
-            // Deleted (`delete --force`) while this process still held it;
-            // writing now would resurrect a container without a scratch layer.
+        if !self.dir().exists() {
             return Ok(());
         }
-        let tmp = self.dir().join("state.json.tmp");
+        // Per process: two writers must not interleave into one temp file.
+        let tmp = self.dir().join(format!("state.json.{}.tmp", std::process::id()));
         std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
         std::fs::rename(tmp, self.dir().join("state.json"))?;
         Ok(())
     }
 
-    /// Held by the supervisor for as long as it runs, so others can tell a
-    /// live run from one whose supervisor was killed (see [`supervised`]).
-    /// Deleting the container directory is still allowed.
-    pub fn lock_supervisor(&self) -> Result<std::fs::File> {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_SHARE_DELETE: u32 = 4;
-        const ERROR_SHARING_VIOLATION: i32 = 32;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .share_mode(FILE_SHARE_DELETE)
-            .open(self.dir().join(LOCK))
-            .map_err(|e| match e.raw_os_error() {
-                Some(ERROR_SHARING_VIOLATION) => anyhow::anyhow!("container {} is already running", self.id),
-                _ => anyhow::Error::new(e).context("lock container"),
-            })
+    /// See [`lock`].
+    pub fn lock_supervisor(&self, wait: Duration) -> Result<std::fs::File> {
+        lock(&self.id, wait)
     }
 
     pub fn load(id: &str) -> Result<Self> {
@@ -122,15 +108,24 @@ impl ContainerState {
 
 const LOCK: &str = "supervisor.lock";
 
-/// Whether a supervisor process currently runs container `id`. Unlike the
-/// recorded status this cannot go stale: the lock dies with the process.
+/// The container's lock, held by its supervisor for as long as it runs, and
+/// by anyone about to release the container's resources (`create`, `system
+/// prune`, network sweeping), so those never act on a live run. Deleting the
+/// container directory is still allowed while it is held.
+pub fn lock(id: &str, wait: Duration) -> Result<std::fs::File> {
+    crate::lock::wait(&paths::container(id).join(LOCK), crate::lock::FILE_SHARE_DELETE, wait).map_err(|e| {
+        if crate::lock::is_held(&e) {
+            anyhow::anyhow!("container {id} is in use (running, starting or stopping)")
+        } else {
+            anyhow::Error::new(e).context(format!("lock container {id}"))
+        }
+    })
+}
+
+/// Whether someone holds container `id`'s lock, normally its supervisor.
+/// Unlike the recorded status this cannot go stale.
 pub fn supervised(id: &str) -> bool {
-    const ERROR_SHARING_VIOLATION: i32 = 32;
-    let lock = paths::container(id).join(LOCK);
-    matches!(
-        std::fs::File::open(lock).map_err(|e| e.raw_os_error()),
-        Err(Some(ERROR_SHARING_VIOLATION))
-    )
+    crate::lock::is_locked(&paths::container(id).join(LOCK))
 }
 
 /// Length of the ID prefix shown in tables.
@@ -158,18 +153,46 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// All containers with a readable state file, reconciled with vmcompute.
+/// Every container's state, plus a description of each state file that
+/// exists but cannot be read. A directory without state.json is a container
+/// still being created and is skipped.
+fn load_all() -> (Vec<ContainerState>, Vec<String>) {
+    let (mut states, mut unreadable) = (Vec::new(), Vec::new());
+    for entry in std::fs::read_dir(paths::containers()).into_iter().flatten().flatten() {
+        let path = entry.path().join("state.json");
+        match std::fs::read(&path) {
+            Ok(data) => match serde_json::from_slice(&data) {
+                Ok(s) => states.push(s),
+                Err(e) => unreadable.push(format!("{}: {e}", path.display())),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => unreadable.push(format!("{}: {e}", path.display())),
+        }
+    }
+    (states, unreadable)
+}
+
+/// All containers whose state can be read, reconciled with vmcompute.
+/// Unreadable ones are reported on stderr.
 pub fn all() -> Vec<ContainerState> {
-    let Ok(dir) = std::fs::read_dir(paths::containers()) else {
-        return Vec::new();
-    };
-    let mut states: Vec<_> = dir
-        .flatten()
-        .filter_map(|e| ContainerState::load(&e.file_name().to_string_lossy()).ok())
-        .collect();
+    let (mut states, unreadable) = load_all();
+    for u in unreadable {
+        eprintln!("warning: unreadable container state {u}");
+    }
     reconcile(&mut states);
     states.sort_by_key(|s| s.created);
     states
+}
+
+/// All containers, or an error if any state file cannot be read. For
+/// garbage collection, which must not take an unreadable container's layers
+/// for unused ones.
+pub fn all_checked() -> Result<Vec<ContainerState>> {
+    let (states, unreadable) = load_all();
+    if !unreadable.is_empty() {
+        bail!("unreadable container state: {}", unreadable.join("; "));
+    }
+    Ok(states)
 }
 
 /// A record left "running" by a supervisor that was killed has no compute

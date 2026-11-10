@@ -192,6 +192,18 @@ fn network_for(name: &str) -> Result<GUID> {
     }
 }
 
+/// Names of the networks winner created.
+pub fn managed() -> Result<Vec<String>> {
+    Ok(hcn::list(Kind::Network, None)?
+        .iter()
+        .filter_map(|n| n["Name"].as_str().filter(|name| is_managed(name, n)).map(String::from))
+        .collect())
+}
+
+fn is_managed(name: &str, network: &Value) -> bool {
+    network_id(name).ok().is_some_and(|g| Some(g) == hcn::id_of(network))
+}
+
 pub fn delete(name: &str) -> Result<()> {
     let network = find(name)?.with_context(|| format!("network {name} not found"))?;
     let id = id_of(&network)?;
@@ -206,7 +218,6 @@ pub fn delete(name: &str) -> Result<()> {
     if !users.is_empty() {
         bail!("network {name} is in use by running containers: {}", users.join(", "));
     }
-    sweep();
     hcn::delete(Kind::Network, &id).with_context(|| format!("delete network {name}"))
 }
 
@@ -282,7 +293,7 @@ pub fn release(container: &str) -> Result<()> {
     hcn::delete(Kind::Endpoint, &endpoint_id(container)?)
 }
 
-/// Release the network objects of containers without a live supervisor
+/// Release the network objects of containers nobody holds the lock of
 /// (killed supervisors, deleted containers). Best effort.
 pub fn sweep() {
     let endpoints = match hcn::list(Kind::Endpoint, None) {
@@ -295,13 +306,21 @@ pub fn sweep() {
     for e in endpoints {
         let Some(id) = e["Name"].as_str().and_then(|n| n.strip_prefix(ENDPOINT_PREFIX)) else { continue };
         let ours = id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit());
-        if !ours || state::supervised(id) {
-            continue;
-        }
         // Only touch objects whose ID we derive: the name alone could collide.
-        if endpoint_id(id).ok() != hcn::id_of(&e) {
+        if !ours || endpoint_id(id).ok() != hcn::id_of(&e) {
             continue;
         }
+        // Hold the container's lock while releasing, so a supervisor cannot
+        // start using these objects meanwhile. No directory: the container is
+        // gone and nothing can start it.
+        let _lock = if crate::paths::container(id).exists() {
+            match state::lock(id, std::time::Duration::ZERO) {
+                Ok(l) => Some(l),
+                Err(_) => continue, // in use
+            }
+        } else {
+            None
+        };
         if let Err(err) = release(id) {
             eprintln!("warning: release network of container {id}: {err:#}");
         }
@@ -352,7 +371,7 @@ pub fn list(format: Format) -> Result<()> {
                 .iter()
                 .map(|n| {
                     let name = n["Name"].as_str().unwrap_or_default();
-                    let managed = network_id(name).ok().is_some_and(|g| Some(g) == hcn::id_of(n));
+                    let managed = is_managed(name, n);
                     [
                         name.to_string(),
                         network_type(n).to_string(),

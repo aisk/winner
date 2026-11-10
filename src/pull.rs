@@ -14,6 +14,7 @@ pub fn pull(reference: &str) -> Result<ImageRecord> {
     let reference = &normalize(reference)?;
     // Layer import needs these; fail before downloading hundreds of MB.
     crate::backup::enable_privileges(&["SeBackupPrivilege", "SeRestorePrivilege"])?;
+    let _lock = crate::image::StoreLock::shared()?;
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let record = rt.block_on(fetch(reference))?;
     import_layers(&record)?;
@@ -57,7 +58,7 @@ async fn fetch(reference: &str) -> Result<ImageRecord> {
 
     // Download layers concurrently on the single-threaded runtime.
     let mut tasks = tokio::task::JoinSet::new();
-    for desc in manifest.layers.iter().cloned() {
+    for desc in manifest.layers.clone() {
         let (client, image) = (client.clone(), image.clone());
         tasks.spawn(async move { download(&client, &image, &desc).await });
     }
@@ -82,7 +83,8 @@ async fn download(client: &Client, image: &Reference, desc: &OciDescriptor) -> R
     // TODO: foreign layers (`...rootfs.foreign.diff.tar.gzip`) must be fetched
     // from `desc.urls` instead of the registry.
     std::fs::create_dir_all(dest.parent().unwrap())?;
-    let tmp = dest.with_extension("partial");
+    // Per process: concurrent pulls of the same blob must not share a file.
+    let tmp = dest.with_extension(format!("partial-{}", std::process::id()));
     let file = tokio::fs::File::create(&tmp).await?;
     eprintln!("downloading {} ({} MB)", desc.digest, desc.size / 1024 / 1024);
     // pull_blob verifies the digest while streaming.
@@ -94,13 +96,31 @@ async fn download(client: &Client, image: &Reference, desc: &OciDescriptor) -> R
     Ok(())
 }
 
+/// Import the layers that are not on disk yet. A layer directory counts only
+/// once its import finished: the import marker is written before and removed
+/// after, so a killed import is redone instead of being taken as complete.
 fn import_layers(record: &ImageRecord) -> Result<()> {
+    // One import at a time across processes; two pulls of images sharing a
+    // layer would otherwise write the same directory.
+    let lock_path = paths::root().join("import.lock");
+    let _lock = crate::lock::wait(&lock_path, crate::lock::FILE_SHARE_NONE, std::time::Duration::from_secs(3600))
+        .context("wait for another layer import")?;
     let mut imported = Vec::new();
     for digest in &record.layers {
         let dir = paths::layer(digest);
+        let marker = paths::import_marker(digest);
+        if marker.exists() {
+            if dir.exists() {
+                layer::destroy(&dir).with_context(|| format!("delete incomplete layer {digest}"))?;
+            }
+            std::fs::remove_file(&marker)?;
+        }
         if !dir.exists() {
             eprintln!("importing {digest}");
+            std::fs::create_dir_all(paths::tmp())?;
+            std::fs::write(&marker, b"")?;
             layer::import(&paths::blob(digest), &dir, &imported)?;
+            std::fs::remove_file(&marker)?;
         }
         imported.push(dir);
     }

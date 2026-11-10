@@ -15,8 +15,10 @@ use std::io::Write;
 
 pub fn main(id: &str) -> Result<()> {
     let mut state = ContainerState::load(id)?;
-    // Fails if another supervisor runs this container; leave its state alone.
-    let lock = state.lock_supervisor()?;
+    // A previous run may still be releasing its resources right after it
+    // recorded the exit. If the lock stays taken, another supervisor runs
+    // this container: fail without touching its state.
+    let lock = state.lock_supervisor(std::time::Duration::from_secs(10))?;
     let result = run::execute(&mut state, Io::Log);
     if let Err(e) = &result {
         let message = format!("{e:#}");

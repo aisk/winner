@@ -21,11 +21,12 @@ fn take_doc(p: PWSTR) -> Option<String> {
     s.filter(|s| !s.is_empty())
 }
 
-/// Attach the HCS result document (which carries the real error details) to a failure.
+/// Attach the HCS result document (which carries the real error details) to
+/// a failure, keeping the `windows::core::Error` reachable via `downcast_ref`.
 fn with_doc(err: windows::core::Error, doc: Option<String>) -> anyhow::Error {
     match doc {
-        Some(doc) => anyhow!("{err}: {doc}"),
-        None => anyhow!(err),
+        Some(doc) => anyhow::Error::new(err).context(doc),
+        None => anyhow::Error::new(err),
     }
 }
 
@@ -174,19 +175,30 @@ impl Process {
         r.map_err(|e| with_doc(e, doc.clone()))?;
         // The result document is a ProcessStatus: { "ProcessId", "Exited", "ExitCode", ... }
         let code = doc
-            .and_then(|d| serde_json::from_str::<serde_json::Value>(&d).ok())
+            .as_deref()
+            .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
             .and_then(|v| v.get("ExitCode")?.as_u64())
-            .unwrap_or(0);
+            .ok_or_else(|| anyhow!("process exited without an exit code: {}", doc.as_deref().unwrap_or("")))?;
         Ok(code as u32)
     }
 
     /// Signal EOF on the process's stdin. Closing our end of the pipe is not
     /// enough because vmcompute relays the stream; hcsshim does the same.
     pub fn close_stdin(&self) -> Result<()> {
-        let req = r#"{"Operation":"CloseHandle","CloseHandle":{"Handle":"StdIn"}}"#;
+        self.modify(r#"{"Operation":"CloseHandle","CloseHandle":{"Handle":"StdIn"}}"#)
+            .context("close process stdin")
+    }
+
+    /// Resize the process's ConPTY (hcsshim `ResizeConsole`).
+    pub fn resize_console(&self, [rows, cols]: [u16; 2]) -> Result<()> {
+        let req = format!(r#"{{"Operation":"ConsoleSize","ConsoleSize":{{"Height":{rows},"Width":{cols}}}}}"#);
+        self.modify(&req).context("resize console")
+    }
+
+    fn modify(&self, request: &str) -> Result<()> {
         let op = Operation::new();
-        unsafe { HcsModifyProcess(self.0, op.0, &HSTRING::from(req)) }.context("HcsModifyProcess")?;
-        op.wait().context("close process stdin")?;
+        unsafe { HcsModifyProcess(self.0, op.0, &HSTRING::from(request)) }.context("HcsModifyProcess")?;
+        op.wait()?;
         Ok(())
     }
 }

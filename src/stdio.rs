@@ -9,6 +9,12 @@ use std::io::{self, Write};
 use std::thread::JoinHandle;
 use windows::Win32::System::Console::*;
 
+/// Whether to use a tty when the user did not say: both ends are a console.
+pub fn detect_tty() -> bool {
+    use std::io::IsTerminal;
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
 /// Start forwarding. Returns the output threads, which finish once the
 /// container closes its ends of the pipes. The stdin thread is detached
 /// because a console read cannot be cancelled portably. `on_stdin_eof` runs

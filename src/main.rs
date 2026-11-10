@@ -7,6 +7,7 @@ mod hcs;
 mod host;
 mod image;
 mod layer;
+mod lock;
 mod network;
 mod paths;
 mod pull;
@@ -15,6 +16,7 @@ mod shim;
 mod spec;
 mod state;
 mod stdio;
+mod system;
 mod table;
 
 use anyhow::Result;
@@ -126,6 +128,11 @@ enum Command {
     Network {
         #[command(subcommand)]
         command: NetworkCommand,
+    },
+    /// Manage winner's data as a whole
+    System {
+        #[command(subcommand)]
+        command: SystemCommand,
     },
     /// Internal: per-container supervisor for detached containers
     #[command(hide = true)]
@@ -262,6 +269,19 @@ enum NetworkCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum SystemCommand {
+    /// Delete stopped containers, unused networks and layers, and leftovers
+    Prune {
+        /// Also delete images no container uses
+        #[arg(short, long)]
+        all: bool,
+        /// Do not ask for confirmation
+        #[arg(short, long)]
+        force: bool,
+    },
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Isolation {
@@ -312,7 +332,7 @@ fn dispatch(command: Command) -> Result<i32> {
         }
         Command::Create { container } => {
             let (image, command, opts) = container.split();
-            done(run::create(&image, &command, opts).map(|s| println!("{}", s.id)))
+            done(run::create(&image, &command, opts).map(|(s, _lock)| println!("{}", s.id)))
         }
         Command::Start { containers } => done(each(&containers, run::start)),
         Command::Stop { timeout, containers } => {
@@ -343,7 +363,13 @@ fn dispatch(command: Command) -> Result<i32> {
             }
             NetworkCommand::List { format } => network::list(format),
             NetworkCommand::Inspect { networks } => network::inspect(&networks),
-            NetworkCommand::Delete { networks } => each(&networks, |n| network::delete(n).map(|()| println!("{n}"))),
+            NetworkCommand::Delete { networks } => {
+                network::sweep();
+                each(&networks, |n| network::delete(n).map(|()| println!("{n}")))
+            }
+        }),
+        Command::System { command } => done(match command {
+            SystemCommand::Prune { all, force } => system::prune(all, force),
         }),
         Command::Shim { id } => done(shim::main(&id)),
     }

@@ -6,7 +6,7 @@ use crate::hcs::System;
 use crate::run::{self, quote_arg};
 use crate::state::{self, ContainerState, ProcessConfig};
 use anyhow::{Context, Result, bail};
-use std::io::{IsTerminal, Read, Write};
+use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
 /// Shut the container down, terminating it if it has not exited after `timeout`.
@@ -17,7 +17,12 @@ pub fn stop(query: &str, timeout: Duration) -> Result<()> {
         if let Err(e) = system.shutdown(timeout) {
             // Not every container honours a shutdown request; fall back to force.
             eprintln!("warning: container {} did not shut down cleanly ({e:#}), terminating", state.id);
-            system.terminate()?;
+            if let Err(e) = system.terminate() {
+                // It may have exited on its own in the meantime.
+                if crate::hcs::running_systems().is_ok_and(|live| live.contains(&state.id)) {
+                    return Err(e);
+                }
+            }
         }
         wait_exited(&state)?;
     }
@@ -36,11 +41,12 @@ pub fn kill(query: &str) -> Result<()> {
     Ok(())
 }
 
-/// The supervisor records the exit; wait for it so a following `delete`
-/// or `start` sees a settled state.
+/// The supervisor records the exit, then releases the network and scratch
+/// layer and its lock; wait for all of it so a following `delete` or `start`
+/// does not collide with that cleanup.
 fn wait_exited(state: &ContainerState) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
-    while state::resolve(&state.id).is_ok_and(|s| s.is_running()) {
+    while state::supervised(&state.id) || state::resolve(&state.id).is_ok_and(|s| s.is_running()) {
         if Instant::now() > deadline {
             bail!("container {} stopped but its state was not updated", state.id);
         }
@@ -69,14 +75,14 @@ pub fn exec(query: &str, args: &[String], opts: ExecOptions) -> Result<u32> {
         working_directory: opts.workdir.or_else(|| state.process.working_directory.clone()),
         user: opts.user.or_else(|| state.process.user.clone()),
     };
-    let tty = opts.tty.unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
+    let tty = opts.tty.unwrap_or_else(crate::stdio::detect_tty);
     run::attach(&system, &process, tty)
 }
 
 pub fn remove(query: &str, force: bool) -> Result<()> {
     let state = state::resolve(query)?;
-    if state.is_running() && !force {
-        bail!("container {} is running; stop it first or use --force", state.id);
+    if (state.is_running() || state::supervised(&state.id)) && !force {
+        bail!("container {} is running or still stopping; stop it first or use --force", state.id);
     }
     run::cleanup(&state)?;
     println!("{}", state.id);

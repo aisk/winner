@@ -24,6 +24,17 @@ pub fn layer(digest: &str) -> PathBuf {
     root().join("layers").join(digest.replace(':', "-"))
 }
 
+/// Staging and bookkeeping of imports; see `image::collect_garbage`.
+pub fn tmp() -> PathBuf {
+    root().join("tmp")
+}
+
+/// Exists while layer `digest` is being imported. Left behind by an
+/// interrupted import, it marks the layer directory as incomplete.
+pub fn import_marker(digest: &str) -> PathBuf {
+    tmp().join(format!("importing-{}", digest.replace(':', "-")))
+}
+
 pub fn images() -> PathBuf {
     root().join("images")
 }

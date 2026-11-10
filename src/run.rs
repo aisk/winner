@@ -12,7 +12,6 @@ use crate::state::{self, ContainerState, ProcessConfig, Status};
 use crate::{Isolation, Pull, host, image, layer, network, paths, pull, stdio};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
-use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
 /// Options shared by `create` and `run`.
@@ -41,7 +40,9 @@ pub enum Io {
 }
 
 /// Record a new container and create its scratch layer. Nothing runs yet.
-pub fn create(image_ref: &str, args: &[String], opts: Options) -> Result<ContainerState> {
+/// Returns the container's lock, so nothing deletes it before the caller
+/// starts it (or lets go).
+pub fn create(image_ref: &str, args: &[String], opts: Options) -> Result<(ContainerState, std::fs::File)> {
     let image = match (opts.pull, image::find(image_ref)?) {
         (Pull::Always, Some(local)) => pull::pull(&local.reference)?,
         (Pull::Always | Pull::Missing, None) => pull::pull(image_ref)?,
@@ -79,31 +80,33 @@ pub fn create(image_ref: &str, args: &[String], opts: Options) -> Result<Contain
         ports,
         remove: opts.remove,
     };
-    state.save()?;
-    if let Err(e) = layer::create_scratch(&state.scratch(), &state.layers) {
+    std::fs::create_dir_all(state.dir())?;
+    let lock = state.lock_supervisor(Duration::ZERO)?;
+    if let Err(e) = state.save().and_then(|()| layer::create_scratch(&state.scratch(), &state.layers)) {
+        drop(lock);
         let _ = std::fs::remove_dir_all(state.dir());
         return Err(e);
     }
-    Ok(state)
+    Ok((state, lock))
 }
 
 /// `run`: create, then either supervise in the foreground (returning the
 /// container's exit code) or start in the background and print the ID.
 pub fn run(image_ref: &str, args: &[String], opts: Options, detach: bool, tty: Option<bool>) -> Result<u32> {
-    let mut state = create(image_ref, args, opts)?;
+    let (mut state, lock) = create(image_ref, args, opts)?;
     if detach {
+        drop(lock); // the shim takes it
         start_detached(&mut state)?;
         println!("{}", state.id);
         return Ok(0);
     }
-    let tty = tty.unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
-    let lock = state.lock_supervisor()?;
+    let tty = tty.unwrap_or_else(stdio::detect_tty);
     let result = execute(&mut state, Io::Console { tty });
     drop(lock);
-    if state.remove {
-        if let Err(e) = cleanup(&state) {
-            eprintln!("warning: cleanup failed: {e:#}");
-        }
+    if state.remove
+        && let Err(e) = cleanup(&state)
+    {
+        eprintln!("warning: cleanup failed: {e:#}");
     }
     result
 }
@@ -111,8 +114,8 @@ pub fn run(image_ref: &str, args: &[String], opts: Options, detach: bool, tty: O
 /// `start`: run an existing created or exited container in the background.
 pub fn start(query: &str) -> Result<()> {
     let mut state = state::resolve(query)?;
-    if state.is_running() {
-        bail!("container {} is already running", state.id);
+    if state.is_running() || state::supervised(&state.id) {
+        bail!("container {} is already running, or still stopping", state.id);
     }
     start_detached(&mut state)?;
     println!("{}", state.id);
@@ -129,12 +132,15 @@ fn start_detached(state: &mut ContainerState) -> Result<()> {
     let mut shim = spawn_shim(&state.id)?;
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
-        if !state.dir().exists() {
+        let current = match ContainerState::load(&state.id) {
+            Ok(c) => c,
             // Ran to completion and was deleted (`--remove`) before we looked.
-            state.status = Status::Exited;
-            return Ok(());
-        }
-        let current = ContainerState::load(&state.id)?;
+            Err(_) if !state.dir().exists() => {
+                state.status = Status::Exited;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
         if let Some(error) = current.error {
             bail!("start container {}: {error}", state.id);
         }
@@ -212,6 +218,9 @@ impl Drop for Terminating {
 /// Supervise one run of the container until its process exits. The caller
 /// holds the supervisor lock ([`ContainerState::lock_supervisor`]).
 pub fn execute(state: &mut ContainerState, io: Io) -> Result<u32> {
+    if matches!(state.isolation, Isolation::Hyperv) {
+        bail!("hyper-v isolation is not implemented yet");
+    }
     let scratch = state.scratch();
     // Left mounted by a supervisor that was killed; we hold the lock, so no
     // live run uses it.
@@ -233,6 +242,7 @@ pub fn execute(state: &mut ContainerState, io: Io) -> Result<u32> {
     };
     let system = Terminating(System::create(&state.id, &config)?);
     let system = &system.0;
+    let _interruptible = matches!(io, Io::Console { .. }).then(|| Interruptible::new(&state.id));
     system.start()?;
 
     let (tty, stdin) = match io {
@@ -246,7 +256,12 @@ pub fn execute(state: &mut ContainerState, io: Io) -> Result<u32> {
     state.save()?;
 
     let code = match io {
-        Io::Console { tty } => forward_console(process, pipes, tty)?,
+        Io::Console { tty } => {
+            let code = forward_console(process, pipes, tty);
+            // Terminated by Ctrl+C: whatever HCS reports for the killed
+            // process (0xC0000001), report it the way Windows does.
+            if INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) { STATUS_CONTROL_C_EXIT } else { code? }
+        }
         Io::Log => {
             let log = std::fs::OpenOptions::new().create(true).append(true).open(state.log())?;
             let outputs = stdio::forward_to_log(pipes, log);
@@ -262,6 +277,54 @@ pub fn execute(state: &mut ContainerState, io: Io) -> Result<u32> {
     state.exit_code = Some(code);
     state.save()?;
     Ok(code)
+}
+
+/// Exit code of a process ended by Ctrl+C.
+const STATUS_CONTROL_C_EXIT: u32 = 0xC000_013A;
+
+/// The container this process runs in the foreground, for the console
+/// control handler, and whether that handler terminated it.
+static FOREGROUND: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// While alive, Ctrl+C / Ctrl+Break / closing the console terminate the
+/// foreground container instead of killing winner, so `execute` still
+/// records the exit and releases the network and scratch layer (and `--remove`
+/// still deletes the container). With a tty, Ctrl+C goes to the container as
+/// input instead and only Ctrl+Break gets here.
+struct Interruptible;
+
+impl Interruptible {
+    fn new(id: &str) -> Self {
+        use windows::Win32::System::Console::SetConsoleCtrlHandler;
+        *FOREGROUND.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.to_string());
+        let _ = unsafe { SetConsoleCtrlHandler(Some(on_console_ctrl), true) };
+        Self
+    }
+}
+
+impl Drop for Interruptible {
+    fn drop(&mut self) {
+        use windows::Win32::System::Console::SetConsoleCtrlHandler;
+        let _ = unsafe { SetConsoleCtrlHandler(Some(on_console_ctrl), false) };
+        *FOREGROUND.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+unsafe extern "system" fn on_console_ctrl(event: u32) -> windows::core::BOOL {
+    const CTRL_CLOSE_EVENT: u32 = 2;
+    let id = FOREGROUND.lock().ok().and_then(|g| g.clone());
+    let Some(id) = id else { return false.into() };
+    INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(system) = System::open(&id) {
+        let _ = system.terminate();
+    }
+    if event == CTRL_CLOSE_EVENT {
+        // Windows ends the process when the handler returns; give the main
+        // thread a moment to clean up.
+        std::thread::sleep(Duration::from_secs(4));
+    }
+    true.into()
 }
 
 pub fn process_parameters(process: &ProcessConfig, tty: bool, stdin: bool) -> ProcessParameters {
@@ -288,7 +351,8 @@ fn forward_console(process: crate::hcs::Process, pipes: crate::hcs::Stdio, tty: 
     let process = std::sync::Arc::new(process);
 
     let _raw = tty.then(stdio::RawConsole::enable);
-    // TODO: forward console resize events (HcsModifyProcess with ConsoleSize).
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let resizer = tty.then(|| watch_console_size(process.clone(), done.clone()));
     let outputs = stdio::forward(pipes, {
         let process = process.clone();
         move || {
@@ -296,11 +360,32 @@ fn forward_console(process: crate::hcs::Process, pipes: crate::hcs::Stdio, tty: 
             let _ = process.close_stdin();
         }
     });
-    let code = process.wait()?;
-    for t in outputs {
+    let code = process.wait();
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    for t in outputs.into_iter().chain(resizer) {
         let _ = t.join();
     }
-    Ok(code)
+    code
+}
+
+/// Forward host console size changes to the container's ConPTY. Polled: the
+/// stdin thread consumes the console input, including resize events.
+fn watch_console_size(
+    process: std::sync::Arc<crate::hcs::Process>,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut last = stdio::RawConsole::size();
+        while !done.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(200));
+            let size = stdio::RawConsole::size();
+            if let Some(s) = size.filter(|_| size != last) {
+                // Fails harmlessly if the process just exited.
+                let _ = process.resize_console(s);
+                last = size;
+            }
+        }
+    })
 }
 
 fn resolve_isolation(image: &ImageRecord, requested: Option<Isolation>) -> Result<Isolation> {

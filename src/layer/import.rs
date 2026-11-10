@@ -108,19 +108,14 @@ impl Driver {
         let kind = entry.header().entry_type();
 
         // Alternate data stream of the file currently being written.
-        if let Some(cur) = &mut self.current {
-            if kind.is_file() {
-                if let Some(stream) = name.strip_prefix(cur.name.as_str()).filter(|s| s.starts_with(':')) {
-                    let size = entry.size();
-                    cur.out.write_all(&backup::stream_header(
-                        backup::BACKUP_ALTERNATE_DATA,
-                        size,
-                        &format!("{stream}:$DATA"),
-                    ))?;
-                    copy_exact(entry, &mut cur.out, size)?;
-                    return Ok(());
-                }
-            }
+        if let Some(cur) = &mut self.current
+            && kind.is_file()
+            && let Some(stream) = name.strip_prefix(cur.name.as_str()).filter(|s| s.starts_with(':'))
+        {
+            let size = entry.size();
+            cur.out.write_all(&backup::stream_header(backup::BACKUP_ALTERNATE_DATA, size, &format!("{stream}:$DATA")))?;
+            copy_exact(entry, &mut cur.out, size)?;
+            return Ok(());
         }
         self.close_current()?;
 
