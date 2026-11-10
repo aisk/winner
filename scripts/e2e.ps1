@@ -248,7 +248,8 @@ Case 'create-start' {
     Check 'logs --follow prints the output and ends' ($r.Code -eq 0 -and $r.Out -match 'created-ok') $r
     $s = State 'e2e-created'
     Check 'exited with code 0' ($s.status -eq 'exited' -and $s.exit_code -eq 0)
-    W @('delete', 'e2e-created') | Out-Null
+    $r = W @('delete', 'e2e-created')
+    Check 'delete right after (waits for the supervisor to finish)' ($r.Code -eq 0) $r
 }
 
 Case 'detach-remove' {
