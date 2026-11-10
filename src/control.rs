@@ -91,7 +91,7 @@ pub fn exec(query: &str, args: &[String], opts: ExecOptions) -> Result<u32> {
         user: opts.user.or_else(|| state.process.user.clone()),
     };
     let tty = opts.tty.unwrap_or_else(crate::stdio::detect_tty);
-    process::attach(&system, &process, tty)
+    process::attach(&state.id, &system, &process, tty)
 }
 
 pub fn remove(query: &str, force: bool) -> Result<()> {

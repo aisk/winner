@@ -7,7 +7,7 @@ use crate::state::ProcessConfig;
 use crate::stdio;
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -25,9 +25,13 @@ pub fn process_parameters(process: &ProcessConfig, tty: bool, stdin: bool) -> Pr
     }
 }
 
-/// Run `process` in `system` with this process's console attached; returns its exit code.
-pub fn attach(system: &System, process: &ProcessConfig, tty: bool) -> Result<u32> {
+/// Run `process` in container `id` (whose compute system is `system`) with
+/// this process's console attached; returns its exit code. Ctrl+C ends only
+/// that process, never the container.
+pub fn attach(id: &str, system: &System, process: &ProcessConfig, tty: bool) -> Result<u32> {
+    let interruptible = Interruptible::new(id, false);
     let (process, pipes) = system.create_process(&process_parameters(process, tty, true))?;
+    interruptible.set_pid(pipes.pid);
     forward_console(process, pipes, tty)
 }
 
@@ -49,7 +53,79 @@ pub fn forward_console(process: Process, pipes: Stdio, tty: bool) -> Result<u32>
     for t in outputs.into_iter().chain(resizer) {
         let _ = t.join();
     }
-    code
+    // Ended by Ctrl+C: whatever HCS reports for the killed process
+    // (0xC0000001), report it the way Windows does.
+    if INTERRUPTED.load(Ordering::Relaxed) { Ok(STATUS_CONTROL_C_EXIT) } else { code }
+}
+
+/// Exit code of a process ended by Ctrl+C.
+const STATUS_CONTROL_C_EXIT: u32 = 0xC000_013A;
+
+/// What the console control handler ends, and whether it did.
+static TARGET: Mutex<Option<Target>> = Mutex::new(None);
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone)]
+struct Target {
+    container: String,
+    /// The attached process, once it exists.
+    pid: Option<u32>,
+    /// End the whole container when there is no process to end (yet).
+    whole_container: bool,
+}
+
+/// While alive, Ctrl+C / Ctrl+Break / closing the console end the attached
+/// process in the container instead of killing winner, so the caller still
+/// gets its exit and cleans up (the supervisor records it and releases the
+/// network and scratch layer; `--remove` still deletes the container). With
+/// a tty, Ctrl+C goes to the container as input and only Ctrl+Break gets
+/// here. Killing winner instead would orphan an `exec`'d process.
+pub struct Interruptible;
+
+impl Interruptible {
+    pub fn new(container: &str, whole_container: bool) -> Self {
+        use windows::Win32::System::Console::SetConsoleCtrlHandler;
+        INTERRUPTED.store(false, Ordering::Relaxed);
+        *target() = Some(Target { container: container.to_string(), pid: None, whole_container });
+        let _ = unsafe { SetConsoleCtrlHandler(Some(on_console_ctrl), true) };
+        Self
+    }
+
+    pub fn set_pid(&self, pid: u32) {
+        if let Some(t) = target().as_mut() {
+            t.pid = Some(pid);
+        }
+    }
+}
+
+impl Drop for Interruptible {
+    fn drop(&mut self) {
+        use windows::Win32::System::Console::SetConsoleCtrlHandler;
+        let _ = unsafe { SetConsoleCtrlHandler(Some(on_console_ctrl), false) };
+        *target() = None;
+    }
+}
+
+fn target() -> std::sync::MutexGuard<'static, Option<Target>> {
+    TARGET.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+unsafe extern "system" fn on_console_ctrl(event: u32) -> windows::core::BOOL {
+    const CTRL_CLOSE_EVENT: u32 = 2;
+    let Some(t) = target().clone() else { return false.into() };
+    INTERRUPTED.store(true, Ordering::Relaxed);
+    if t.whole_container {
+        // Its main process if known, else the compute system.
+        let _ = crate::control::end(&t.container, t.pid);
+    } else if let Some(pid) = t.pid {
+        let _ = System::open(&t.container).and_then(|s| s.open_process(pid)?.terminate());
+    }
+    if event == CTRL_CLOSE_EVENT {
+        // Windows ends the process when the handler returns; give the main
+        // thread a moment to clean up.
+        std::thread::sleep(Duration::from_secs(4));
+    }
+    true.into()
 }
 
 /// Forward host console size changes to the container's ConPTY. Polled: the

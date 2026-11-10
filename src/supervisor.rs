@@ -5,7 +5,7 @@
 //! attached, or in a detached `winner shim` process writing to the log.
 
 use crate::hcs::System;
-use crate::process::{forward_console, process_parameters};
+use crate::process::{Interruptible, forward_console, process_parameters};
 use crate::spec::{self, ComputeSystem, Container, ContainerV1, HvRuntime, Networking, Storage};
 use crate::state::{ContainerState, Isolation, Status};
 use crate::{layer, network, stdio};
@@ -98,7 +98,8 @@ pub fn execute(state: &mut ContainerState, io: Io) -> Result<u32> {
         }
     };
     let system = &system.0;
-    let _interruptible = matches!(io, Io::Console { .. }).then(|| Interruptible::new(&state.id));
+    // Before the main process exists, Ctrl+C ends the whole container.
+    let interruptible = matches!(io, Io::Console { .. }).then(|| Interruptible::new(&state.id, true));
     system.start()?;
     if !state.started {
         state.started = true;
@@ -110,7 +111,9 @@ pub fn execute(state: &mut ContainerState, io: Io) -> Result<u32> {
         Io::Log => (false, false),
     };
     let (process, pipes) = system.create_process(&process_parameters(&state.process, tty, stdin))?;
-    FOREGROUND_PID.store(pipes.pid, std::sync::atomic::Ordering::Relaxed);
+    if let Some(i) = &interruptible {
+        i.set_pid(pipes.pid);
+    }
     // Only now is it running: `start` treats this as success, so a process
     // that fails to launch must surface as an error instead.
     state.status = Status::Running;
@@ -118,12 +121,7 @@ pub fn execute(state: &mut ContainerState, io: Io) -> Result<u32> {
     state.save()?;
 
     let code = match io {
-        Io::Console { tty } => {
-            let code = forward_console(process, pipes, tty);
-            // Terminated by Ctrl+C: whatever HCS reports for the killed
-            // process (0xC0000001), report it the way Windows does.
-            if INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) { STATUS_CONTROL_C_EXIT } else { code? }
-        }
+        Io::Console { tty } => forward_console(process, pipes, tty)?,
         Io::Log => {
             let log = std::fs::OpenOptions::new().create(true).append(true).open(state.log())?;
             let outputs = stdio::forward_to_log(pipes, log);
@@ -140,54 +138,4 @@ pub fn execute(state: &mut ContainerState, io: Io) -> Result<u32> {
     state.pid = None;
     state.save()?;
     Ok(code)
-}
-
-/// Exit code of a process ended by Ctrl+C.
-const STATUS_CONTROL_C_EXIT: u32 = 0xC000_013A;
-
-/// The container this process runs in the foreground, for the console
-/// control handler, and whether that handler terminated it.
-static FOREGROUND: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Its main process, once started (0 before).
-static FOREGROUND_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// While alive, Ctrl+C / Ctrl+Break / closing the console terminate the
-/// foreground container instead of killing winner, so `execute` still
-/// records the exit and releases the network and scratch layer (and `--remove`
-/// still deletes the container). With a tty, Ctrl+C goes to the container as
-/// input instead and only Ctrl+Break gets here.
-struct Interruptible;
-
-impl Interruptible {
-    fn new(id: &str) -> Self {
-        use windows::Win32::System::Console::SetConsoleCtrlHandler;
-        *FOREGROUND.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.to_string());
-        let _ = unsafe { SetConsoleCtrlHandler(Some(on_console_ctrl), true) };
-        Self
-    }
-}
-
-impl Drop for Interruptible {
-    fn drop(&mut self) {
-        use windows::Win32::System::Console::SetConsoleCtrlHandler;
-        let _ = unsafe { SetConsoleCtrlHandler(Some(on_console_ctrl), false) };
-        *FOREGROUND.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        FOREGROUND_PID.store(0, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-unsafe extern "system" fn on_console_ctrl(event: u32) -> windows::core::BOOL {
-    const CTRL_CLOSE_EVENT: u32 = 2;
-    let id = FOREGROUND.lock().ok().and_then(|g| g.clone());
-    let Some(id) = id else { return false.into() };
-    INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
-    let pid = FOREGROUND_PID.load(std::sync::atomic::Ordering::Relaxed);
-    let _ = crate::control::end(&id, (pid != 0).then_some(pid));
-    if event == CTRL_CLOSE_EVENT {
-        // Windows ends the process when the handler returns; give the main
-        // thread a moment to clean up.
-        std::thread::sleep(Duration::from_secs(4));
-    }
-    true.into()
 }
