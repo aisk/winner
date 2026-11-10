@@ -95,16 +95,36 @@ pub fn exec(query: &str, args: &[String], opts: ExecOptions) -> Result<u32> {
 }
 
 pub fn remove(query: &str, force: bool) -> Result<()> {
-    let state = state::resolve(query)?;
-    if (state.is_running() || state::supervised(&state.id)) && !force {
-        bail!("container {} is running or still stopping; stop it first or use --force", state.id);
-    }
+    let mut state = state::resolve(query)?;
+    let _lock = if force {
+        None
+    } else {
+        check_not_running(&state)?;
+        // An exited container's supervisor may still be releasing what the
+        // run used; it holds the lock until it is done.
+        let lock = state::lock(&state.id, EXIT_CLEANUP)?;
+        // Reload, reconciled: a killed supervisor leaves `running` on disk.
+        state = state::resolve(&state.id)?;
+        check_not_running(&state)?;
+        Some(lock)
+    };
     run::cleanup(&state)?;
     println!("{}", state.id);
     // Layers kept alive only by this container (its image was deleted with
     // --force) are garbage now.
     if crate::image::find(&state.image).ok().flatten().is_none() {
         crate::store::collect_garbage();
+    }
+    Ok(())
+}
+
+/// How long to wait for a supervisor to finish after its container exited:
+/// it shuts the compute system down, then releases network and scratch.
+pub const EXIT_CLEANUP: Duration = Duration::from_secs(30);
+
+fn check_not_running(state: &ContainerState) -> Result<()> {
+    if state.is_running() {
+        bail!("container {} is running; stop it first or use --force", state.id);
     }
     Ok(())
 }

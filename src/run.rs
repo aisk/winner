@@ -117,9 +117,17 @@ pub fn run(image_ref: &str, args: &[String], opts: Options, detach: bool, tty: O
 
 /// `start`: run an existing created or exited container in the background.
 pub fn start(query: &str) -> Result<()> {
-    let mut state = state::resolve(query)?;
-    if state.is_running() || state::supervised(&state.id) {
-        bail!("container {} is already running, or still stopping", state.id);
+    let state = state::resolve(query)?;
+    if state.is_running() {
+        bail!("container {} is already running", state.id);
+    }
+    // Let a supervisor still cleaning up after the last exit finish. The shim
+    // takes the lock itself, so only wait for it here.
+    drop(state::lock(&state.id, crate::control::EXIT_CLEANUP)?);
+    // Reload, reconciled: a killed supervisor leaves `running` on disk.
+    let mut state = state::resolve(&state.id)?;
+    if state.is_running() {
+        bail!("container {} is already running", state.id);
     }
     start_detached(&mut state)?;
     println!("{}", state.id);
