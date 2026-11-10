@@ -230,6 +230,9 @@ Case 'detach' {
     Check 'start it again' ($r.Code -eq 0 -and (State 'e2e-bg').status -eq 'running') $r
     $r = W @('kill', 'e2e-bg')
     Check 'kill' ($r.Code -eq 0 -and (State 'e2e-bg').status -eq 'exited') $r
+    $r = W @('start', 'e2e-bg')
+    Check 'start right after kill (supervisor cleanup has finished)' ($r.Code -eq 0) $r
+    W @('kill', 'e2e-bg') | Out-Null
     $r = W @('delete', 'e2e-bg')
     Check 'delete' ($r.Code -eq 0) $r
 }
@@ -279,6 +282,50 @@ Case 'orphan' {
     $r = W @('delete', 'e2e-orphan')
     Check 'delete without --force' ($r.Code -eq 0) $r
     Check 'no endpoint is left' (-not ((Endpoints) -contains "winner-$id"))
+}
+
+Case 'interrupt' {
+    # The foreground run needs a console of its own, so a helper pwsh opens
+    # one, starts winner in it, and sends Ctrl+Break to that console while
+    # swallowing the event itself. (Sending from outside with AttachConsole
+    # never arrived.) Ctrl+Break because a process started this way may have
+    # Ctrl+C ignored; winner handles both the same way.
+    $helper = Join-Path ([IO.Path]::GetTempPath()) "winner-e2e-int-$PID.ps1"
+    Set-Content $helper @'
+param($Winner, $Nano)
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class Ctrl {
+    public delegate bool Handler(uint e);
+    static Handler swallow = e => true;
+    [DllImport("kernel32.dll")] static extern bool SetConsoleCtrlHandler(Handler h, bool add);
+    [DllImport("kernel32.dll")] public static extern bool GenerateConsoleCtrlEvent(uint e, uint group);
+    public static void Swallow() { SetConsoleCtrlHandler(swallow, true); }
+}
+"@
+$w = Start-Process -FilePath $Winner -ArgumentList @('run', '--name', 'e2e-int', '--no-tty', $Nano, 'ping', '-n', '120', '127.0.0.1') -NoNewWindow -PassThru
+$deadline = (Get-Date).AddSeconds(60)
+while ((Get-Date) -lt $deadline) {
+    $s = & $Winner inspect e2e-int 2>$null | ConvertFrom-Json
+    if ($s -and $s[0].status -eq 'running') { break }
+    Start-Sleep -Milliseconds 500
+}
+[Ctrl]::Swallow()
+if (-not [Ctrl]::GenerateConsoleCtrlEvent(1, 0)) { exit 3 }
+if (-not $w.WaitForExit(30000)) { $w.Kill(); exit 4 }
+exit $w.ExitCode
+'@
+    try {
+        $h = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList @('-NoProfile', '-File', $helper, $Winner, $Nano) -WindowStyle Minimized -PassThru -Wait
+        $s = State 'e2e-int'
+        Check 'winner exits with the Ctrl+C exit code (its handler ran)' ($h.ExitCode -eq -1073741510) ([pscustomobject]@{ Code = $h.ExitCode })
+        Check 'the exit is recorded' ($s -and $s.status -eq 'exited' -and $s.exit_code -eq 3221225786)
+        Check 'its endpoint is released' ($s -and -not ((Endpoints) -contains "winner-$($s.id)"))
+    } finally {
+        Remove-Item -Force $helper
+        W @('delete', '--force', 'e2e-int') | Out-Null
+    }
 }
 
 # --- networking ------------------------------------------------------------
@@ -363,6 +410,41 @@ Case 'layers' {
     Check 'files from upper layers and PATH from their registry hives' ($r.Code -eq 0 -and $r.Out -match 'Microsoft\.NETCore\.App 10\.') $r
     $r = W @('run', '--remove', $Dotnet, 'cmd', '/c', 'echo user=%USERNAME% v=%DOTNET_VERSION%')
     Check 'image user and env' ($r.Out -match 'user=ContainerUser' -and $r.Out -match 'v=10\.') $r
+}
+
+# --- system prune ----------------------------------------------------------
+
+Case 'prune' {
+    # prune is not scoped to the tests: skip it rather than delete stopped
+    # containers that belong to the user.
+    $foreign = @(((W @('list', '--format', 'json')).Out | ConvertFrom-Json) | Where-Object { $_.status -ne 'running' -and $_.name -notlike 'e2e-*' })
+    if ($foreign.Count -gt 0) {
+        Say "  skip: $($foreign.Count) stopped containers not created by the tests" 'Yellow'
+        return
+    }
+    W @('run', '-d', '--name', 'e2e-alive', $Nano, 'ping', '-n', '120', '127.0.0.1') | Out-Null
+    W @('create', '--name', 'e2e-stopped', $Nano) | Out-Null
+    W @('network', 'create', 'e2e-net') | Out-Null
+    $tmp = Join-Path $env:ProgramData 'winner\tmp\import-e2e'
+    New-Item -ItemType Directory -Force $tmp | Out-Null
+    # An import killed halfway: the layer directory plus its marker.
+    $halfLayer = Join-Path $env:ProgramData 'winner\layers\sha256-e2e0000000000000000000000000000000000000000000000000000000000000'
+    $marker = Join-Path $env:ProgramData 'winner\tmp\importing-sha256-e2e0000000000000000000000000000000000000000000000000000000000000'
+    New-Item -ItemType Directory -Force $halfLayer | Out-Null
+    New-Item -ItemType File -Force $marker | Out-Null
+    $r = W @('system', 'prune')
+    Check 'refuses to run without a terminal or --force' ($r.Code -ne 0 -and $r.Err -match '--force') $r
+    $r = W @('system', 'prune', '--force') -Timeout 300
+    Check 'system prune --force' ($r.Code -eq 0 -and $r.Out -match 'reclaimed') $r
+    Check 'stopped container deleted' (-not (State 'e2e-stopped'))
+    Check 'running container kept' ((State 'e2e-alive').status -eq 'running')
+    $nets = (W @('network', 'list')).Out
+    Check 'unused network deleted, the one in use kept' ($nets -notmatch 'e2e-net' -and $nets -match '(?m)^winner\s') $nets
+    Check 'leftover import staging deleted' (-not (Test-Path $tmp))
+    Check 'half-imported layer and its marker deleted' (-not (Test-Path $halfLayer) -and -not (Test-Path $marker))
+    $r = W @('image', 'list', '--format', 'json')
+    Check 'images kept without --all' ((($r.Out | ConvertFrom-Json).reference) -contains $Nano) $r
+    W @('delete', '--force', 'e2e-alive') | Out-Null
 }
 
 if ($Full) {
